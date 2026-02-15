@@ -1,0 +1,11 @@
+__pycache__/
+=10.1
+s3:/
+gemini_style_transfer_output/
+similarity_stats/
+output/
+LongCat-Image/
+logs/
+space_label/
+.vscode/
+.cache/

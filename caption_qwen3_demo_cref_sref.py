@@ -142,7 +142,10 @@ def list_images(folder: str) -> dict:
     return items
 
 def build_prompt(caption: str, idx: int) -> str:
-    return caption or ""
+    sentence = STYLE_SENTENCES[idx % len(STYLE_SENTENCES)]
+    if caption:
+        return f"{caption} {sentence}"
+    return f"{sentence}"
 
 def load_existing(out_path: str) -> dict:
     if not os.path.isfile(out_path):

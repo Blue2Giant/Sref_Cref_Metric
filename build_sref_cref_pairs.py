@@ -15,14 +15,14 @@ from megfile.smart import smart_listdir, smart_exists, smart_makedirs, smart_ope
 python /data/LoraPipeline/utils/build_sref_cref_pairs.py \
   --content-dir /mnt/jfs/bench-bucket/sref_bench/bench_1106_content_prompt \
   --style-dir /mnt/jfs/bench-bucket/sref_bench/bench_0222_style/bench_1022_style/ \
-  --out-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref \
+  --out-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_new  \
   --num-combos 800 \
   --max-side 2048 \
-  --seed 42
+  --seed 288
 python /data/LoraPipeline/utils/build_sref_cref_pairs.py \
   --content-dir /mnt/jfs/bench-bucket/sref_bench/bench_1106_content_prompt \
   --style-dir /mnt/jfs/bench-bucket/sref_bench/bench_0222_style/bench_1022_style/ \
-  --out-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_sref \
+  --out-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_sref\
   --num-combos 800 \
   --seed 200 \
   --max-side 2048 

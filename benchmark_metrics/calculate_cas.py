@@ -1,3 +1,8 @@
+"""
+python3 /data/benchmark_metrics/benchmark_metrics/calculate_cas.py \
+    /data/benchmark_metrics/sample_1500_bench_sref/cref/000000.png \
+    /data/benchmark_metrics/sample_1500_bench_sref/sref/000000.png
+"""
 import argparse
 import torch
 from PIL import Image
@@ -16,7 +21,7 @@ def calc_mean_std(feat, eps=1e-5):
 
 def load_model(device):
     # Try to load from local path first, otherwise use Hugging Face Hub
-    local_path = '/data/midjourney/model_zoo/ckpts/dinov2-base'
+    local_path = '/mnt/jfs/model_zoo/dinov2-base/'
     model_name = "facebook/dinov2-base"
     
     if os.path.exists(local_path):

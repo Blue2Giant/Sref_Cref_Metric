@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-python3 /data/benchmark_metrics/caption_gpt4o_cref_sref.py  \
-    --root /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref   --workers 16 \
-    --out prompts_duling.json --overwrite
+python3 /data/benchmark_metrics/caption_gpt4o_dual_lang.py \
+    --root /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_new \
+    --workers 2 \
+    --limit 5 \
+    --out prompts_dual.json
 """
 import argparse
 import base64
@@ -27,106 +29,34 @@ TIMEOUT = 360
 RESIZE_MAX_SIDE = 384
 JPEG_QUALITY = 85
 
-STYLE_TERMS = [
-    r"二次元", r"动漫", r"漫画风", r"漫画", r"插画", r"插图", r"水彩", r"油画", r"丙烯", r"素描", r"速写",
-    r"线稿", r"线描", r"国画", r"泼墨", r"像素风", r"赛博朋克", r"蒸汽波", r"低多边形", r"渲染",
-    r"CG", r"3D", r"3D渲染", r"次世代", r"卡通", r"写实风", r"电影感", r"胶片感", r"赛璐璐", r"上色",
-    r"赛璐璐上色", r"喷枪", r"版画", r"水墨", r"扁平风", r"抽象风", r"风格化", r"风格", r"画风",
-    r"anime", r"manga", r"cartoon", r"illustration", r"watercolor", r"oil\s*paint(?:ing)?",
-    r"sketch", r"line\s*art", r"ink", r"charcoal", r"pastel", r"pixel\s*art",
-    r"low\s*poly", r"render", r"3d", r"cgi", r"stylized", r"digital\s*art",
-    r"concept\s*art", r"matte\s*painting", r"cinematic", r"film\s*grain", r"bokeh",
-]
-
-system_prompt = """
+SYSTEM_PROMPT = """
 You are a professional image-synthesis prompt generator.
-Your task is to analyze reference image and create one JSON object containing exactly two ready-to-use image-generation instructions: one in Chinese and one in English.
-Each instruction must be a single detailed caption that a image generator can use directly.
+Your task is to analyze the reference image and create one JSON object containing exactly two ready-to-use image-generation instructions: one in Chinese and one in English.
+Each instruction must be a single detailed caption that an image generator can use directly.
 Important rules:
 - The synthesis must not look like pasted or cut-out elements. The result must appear as a newly rendered, seamless picture.
-- The subject from reference image  must interact naturally (e.g., holding, sitting on, standing next to, walking through, leaning against).
-- Encourage diversity: vary actions, poses, and arrangements so that the instructions are not just static placement but describe dynamic or meaningful interactions.
+- The subject from the reference image must interact naturally (e.g., holding, sitting on, standing next to, walking through, leaning against).
+- Ensure diversity: vary actions, poses, and arrangements so that the instructions are not just static placement but describe dynamic or meaningful interactions.
 - The final image must associate with the reference image.
 Output format:
 Return only valid JSON, no extra explanation. The JSON must have this structure:
 {
 "instructions": [
-    {"language": "CN", "caption": "中文合成指令},
+    {"language": "CN", "caption": "中文合成指令"},
     {"language": "EN", "caption": "English synthesis instruction"}
 ]
 }
 """
 
-user_prompt = """
-You will be provided with two reference files:
-- reference.png (treat as image_1)
+USER_INSTRUCTION = """
+You will be provided with a reference image.
 Task:
-Analyze image internally and return exactly ONE JSON object with the key "instructions". 
+Analyze the image and return exactly ONE JSON object with the key "instructions". 
 Its value must be an array of exactly two objects:
 1. A Chinese instruction ("language": "CN")
 2. An English instruction ("language": "EN")
 Each instruction must follow the system rules to generate one seamless, realistic photograph.
 """
-
-# SYSTEM_PROMPT = (
-#     "You are an image prompt writer. Output must be in ENGLISH ONLY.\n"
-#     "Goal: craft one concise text-to-image prompt for a NEW image inspired by the given content image.\n"
-#     "Rules:\n"
-#     "1) Keep the same main subject(s) and key attributes from the content image, then place them in a plausible new scene.\n"
-#     "2) Include action, setting, objects, and composition cues when helpful.\n"
-#     "3) Do NOT use style/medium/render/camera words or mention 'reference'/'content image'.\n"
-#     "4) One sentence only; specific and actionable; no second person.\n"
-#     "Respond in clear, concise English only."
-# )
-
-# USER_INSTRUCTION = (
-#     "Write one sentence to generate a new image inspired by the provided content image. "
-#     "Keep the subject(s) and key visual attributes, and place them in a new, related situation. "
-#     "Avoid style/medium/camera words and do not mention any reference."
-# )
-SYSTEM_PROMPT = (
-    "You are a CREATIVE text-to-image prompt writer. You must provide two versions of the prompt: one in English and one in Chinese.\n"
-    "The meaning of both versions must be consistent.\n"
-    "Goal: Based on the content of the picture, imagine a piece of text to describe a new scene. In this scene, there should be a subject related to the subject in the content picture.\n"
-    "Hard rules:\n"
-    "1) Do NOT describe the exact visible details from the reference; do NOT copy entities verbatim; avoid 'same/exact/identical/replicate'.\n"
-    "2) Do NOT mention the reference, or 'in the image/photo/picture'.\n"
-    "3) Do NOT mention art style, medium, rendering, filters, or camera terms (lens, shot, bokeh, cinematic, film grain, etc.).\n"
-    "4) Output the results in JSON format with keys 'en' and 'zh'. Each value should be exactly ONE sentence, no extra text."
-)
-
-USER_INSTRUCTION = (
-    "Write a single-sentence text-to-image prompt, reimagined from the content reference, providing both English and Chinese versions in JSON format (keys: 'en', 'zh'). "
-    "Do not use the word 'imagine' in the description. The prompt you create should be relevant to the content image.But different from the content image."
-    "Avoid style/media/camera terms."
-)
-
-
-STYLE_SENTENCES = [
-    "Transfer the style into the style reference picture.",
-    "Transfer the style into the style reference image.",
-    "Transfer the style to the style reference picture.",
-    "Apply the style to the style reference picture.",
-    "Adopt the style from the style reference picture.",
-    "Embrace the aesthetic of the style reference picture.",
-    "Incorporate the style from the style reference image.",
-    "Reflect the style of the style reference picture.",
-    "Capture the essence of the style reference image.",
-    "Utilize the style from the style reference picture.",
-]
-
-STYLE_SENTENCES_ZH = [
-    "将风格迁移到风格参考图中。",
-    "将风格迁移到风格参考图像中。",
-    "将风格应用到风格参考图。",
-    "将风格应用到风格参考图片。",
-    "采用风格参考图中的风格。",
-    "接纳风格参考图的美学特征。",
-    "融合风格参考图像中的风格。",
-    "体现风格参考图的风格。",
-    "捕捉风格参考图像的精髓。",
-    "利用风格参考图中的风格。",
-]
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
@@ -169,27 +99,11 @@ def to_data_uri_resized_local(path: str) -> str:
     return _img_to_data_uri_jpeg(img, JPEG_QUALITY)
 
 
-def sanitize_prompt(text: str) -> str:
-    if not text:
-        return ""
-    clean = text.strip()
-    clean = re.sub(r"^[\"'`‘’“”\s]+|[\"'`‘’“”\s]+$", "", clean)
-    for term in STYLE_TERMS:
-        pattern = rf"(?:{term})(?:\s*(?:风格|风))?"
-        clean = re.sub(pattern, "", clean, flags=re.IGNORECASE)
-    clean = re.sub(r"\s+", " ", clean)
-    clean = re.sub(r"\s*([,.;:!?])\s*", r"\1 ", clean)
-    clean = re.sub(r"\s+$", "", clean)
-    if len(clean) > 240:
-        clean = clean[:240].rstrip(",.;:!? ")
-    return clean or text.strip()
-
-
 def build_payload(data_uri: str) -> dict:
     return {
         "model": MODEL,
         "stream": False,
-        "max_tokens": 200,
+        "max_tokens": 1000,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -200,15 +114,8 @@ def build_payload(data_uri: str) -> dict:
                 ],
             },
         ],
+        "response_format": {"type": "json_object"}
     }
-
-
-def build_prompt(core_en: str, core_zh: str, idx: int) -> tuple:
-    sentence_en = STYLE_SENTENCES[idx % len(STYLE_SENTENCES)]
-    sentence_zh = STYLE_SENTENCES_ZH[idx % len(STYLE_SENTENCES_ZH)]
-    prompt_en = f"{core_en}{sentence_en}" if core_en else sentence_en
-    prompt_zh = f"{core_zh}{sentence_zh}" if core_zh else sentence_zh
-    return prompt_en, prompt_zh
 
 
 def list_images(folder: str) -> dict:
@@ -237,9 +144,22 @@ def load_existing(out_path: str) -> dict:
     return {}
 
 
+def sort_key(key):
+    # Try to extract number from basename for sorting
+    # e.g. "123" -> 123, "img_123" -> 123
+    # If no number found, use string sorting
+    nums = re.findall(r'\d+', key)
+    if nums:
+        return int(nums[0])
+    return key
+
 def save_json(out_path: str, data: dict) -> None:
+    # Sort data by key (using numeric sort if possible) before saving
+    sorted_items = sorted(data.items(), key=lambda x: sort_key(x[0]))
+    sorted_data = dict(sorted_items)
+    
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(sorted_data, f, ensure_ascii=False, indent=2)
 
 
 def init_session():
@@ -252,7 +172,7 @@ def init_session():
 
 
 def worker(task):
-    base, cref_path, idx = task
+    base, cref_path = task
     t0 = time.time()
     try:
         data_uri = to_data_uri_resized_local(cref_path)
@@ -263,26 +183,32 @@ def worker(task):
         data = resp.json()
         raw = data["choices"][0]["message"]["content"]
         
-        # Try to parse JSON from the response
+        # Parse JSON
         try:
-            # Handle possible markdown code blocks
-            json_str = raw
-            if "```json" in raw:
-                json_str = raw.split("```json")[1].split("```")[0].strip()
-            elif "```" in raw:
-                json_str = raw.split("```")[1].split("```")[0].strip()
+            res = json.loads(raw)
+            instructions = res.get("instructions", [])
+            prompt_cn = ""
+            prompt_en = ""
             
-            res = json.loads(json_str)
-            core_en = sanitize_prompt(res.get("en", ""))
-            core_zh = sanitize_prompt(res.get("zh", ""))
-        except Exception:
-            # Fallback if JSON parsing fails
-            core_en = sanitize_prompt(raw)
-            core_zh = core_en # Fallback to English if Chinese is missing
+            for item in instructions:
+                lang = item.get("language", "").upper()
+                if lang == "CN":
+                    prompt_cn = item.get("caption", "")
+                elif lang == "EN":
+                    prompt_en = item.get("caption", "")
             
-        prompt_en, prompt_zh = build_prompt(core_en, core_zh, idx)
+            if not prompt_cn and not prompt_en:
+                # Fallback if structure is unexpected
+                prompt_en = raw
+                prompt_cn = raw
+
+        except Exception as e:
+            # Fallback
+            prompt_en = raw
+            prompt_cn = raw
+            
         dt = time.time() - t0
-        return base, (prompt_en, prompt_zh), True, dt, ""
+        return base, (prompt_en, prompt_cn), True, dt, ""
     except Exception as e:
         dt = time.time() - t0
         return base, ("", ""), False, dt, str(e)
@@ -293,7 +219,7 @@ def main():
     parser.add_argument("--root", required=True)
     parser.add_argument("--cref", default="cref")
     parser.add_argument("--sref", default="sref")
-    parser.add_argument("--out", default="prompts.json")
+    parser.add_argument("--out", default="prompts_dual.json")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--overwrite", action="store_true")
@@ -304,18 +230,23 @@ def main():
     root = args.root
     cref_dir = os.path.join(root, args.cref)
     sref_dir = os.path.join(root, args.sref)
+    
+    # Define output paths
     out_base, out_ext = os.path.splitext(args.out)
     out_path_en = os.path.join(root, f"{out_base}_en{out_ext}")
     out_path_zh = os.path.join(root, f"{out_base}_zh{out_ext}")
 
     if not os.path.isdir(cref_dir):
         raise FileNotFoundError(f"cref dir not found: {cref_dir}")
+    # sref_dir check is kept for compatibility but not strictly used for logic pairing anymore 
+    # unless we want to filter common basenames.
     if not os.path.isdir(sref_dir):
         raise FileNotFoundError(f"sref dir not found: {sref_dir}")
 
     cref_map = list_images(cref_dir)
     sref_map = list_images(sref_dir)
-    common = sorted(set(cref_map.keys()) & set(sref_map.keys()))
+    common = sorted(set(cref_map.keys()) & set(sref_map.keys()), key=lambda x: sort_key(x))
+    
     if args.limit and args.limit > 0:
         common = common[: args.limit]
     if not common:
@@ -341,7 +272,8 @@ def main():
         print("No new items to process.")
         return
 
-    tasks = [(base, cref_map[base], idx) for idx, base in enumerate(common)]
+    # No idx needed since we don't use STYLE_SENTENCES
+    tasks = [(base, cref_map[base]) for base in common]
     ctx = get_context("spawn")
     errors = {}
 

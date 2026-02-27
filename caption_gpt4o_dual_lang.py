@@ -3,8 +3,9 @@
 """
 python3 /data/benchmark_metrics/caption_gpt4o_dual_lang.py \
     --root /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_new \
-    --workers 2 \
-    --limit 5 \
+    --workers 4 \
+    --limit 10 \
+    --overwrite \
     --out prompts_dual.json
 """
 import argparse

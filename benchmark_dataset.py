@@ -1,3 +1,6 @@
+"""
+upload benchmark data
+"""
 from huggingface_hub import HfApi
 api = HfApi()
 api.create_repo("Blue2Giant/Sref_Cref_Benchmark_800", repo_type="dataset",

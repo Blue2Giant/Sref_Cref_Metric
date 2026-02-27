@@ -11,3 +11,4 @@ space_label/
 .cache/
 sample_1500_bench_sref/
 sample_1500_bench_cref_sref/
+.vscode/

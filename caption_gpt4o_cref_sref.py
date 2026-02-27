@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-python3 /data/LoraPipeline/caption_pipeline/caption_gpt4o_cref_sref.py  \
+python3 /data/benchmark_metrics/caption_gpt4o_cref_sref.py  \
     --root /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref   --workers 16 \
-    --out prompts.json 
+    --out prompts_duling.json --overwrite
 """
 import argparse
 import base64
@@ -55,21 +55,24 @@ STYLE_TERMS = [
 #     "Avoid style/medium/camera words and do not mention any reference."
 # )
 SYSTEM_PROMPT = (
-    "You are a CREATIVE text-to-image prompt writer. Output must be ENGLISH ONLY.\n"
-    "Goal: Based on the content of the picture, imagine a piece of text to describe a new scene. In this scene, there should be a subject related to the subject in the content picture. Please describe it in English.\n"
+    "You are a CREATIVE text-to-image prompt writer. You must provide two versions of the prompt: one in English and one in Chinese.\n"
+    "The meaning of both versions must be consistent.\n"
+    "Goal: Based on the content of the picture, imagine a piece of text to describe a new scene. In this scene, there should be a subject related to the subject in the content picture.\n"
     "Hard rules:\n"
     "1) Do NOT describe the exact visible details from the reference; do NOT copy entities verbatim; avoid 'same/exact/identical/replicate'.\n"
     "2) Do NOT mention the reference, or 'in the image/photo/picture'.\n"
     "3) Do NOT mention art style, medium, rendering, filters, or camera terms (lens, shot, bokeh, cinematic, film grain, etc.).\n"
-    "4) Output exactly ONE sentence, no lists, no extra text."
+    "4) Output the results in JSON format with keys 'en' and 'zh'. Each value should be exactly ONE sentence, no extra text."
 )
 
 """
 描述的画面内容应该和内容图的差异大一点，不要和内容图完全一样。要更多样并且更加丰富。
+米奥术
 """
 USER_INSTRUCTION = (
-    "Write a single-sentence English text-to-image prompt for a new scene reimagined from the content reference. "
-    "avoid style/media/camera terms."
+    "Write a single-sentence text-to-image prompt, reimagined from the content reference, providing both English and Chinese versions in JSON format (keys: 'en', 'zh'). "
+    "Do not use the word 'imagine' in the description. The prompt you create should be relevant to the content image.But different from the content image."
+    "Avoid style/media/camera terms."
 )
 
 
@@ -84,6 +87,19 @@ STYLE_SENTENCES = [
     "Reflect the style of the style reference picture.",
     "Capture the essence of the style reference image.",
     "Utilize the style from the style reference picture.",
+]
+
+STYLE_SENTENCES_ZH = [
+    "将风格迁移到风格参考图中。",
+    "将风格迁移到风格参考图像中。",
+    "将风格应用到风格参考图。",
+    "将风格应用到风格参考图片。",
+    "采用风格参考图中的风格。",
+    "接纳风格参考图的美学特征。",
+    "融合风格参考图像中的风格。",
+    "体现风格参考图的风格。",
+    "捕捉风格参考图像的精髓。",
+    "利用风格参考图中的风格。",
 ]
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
@@ -161,9 +177,12 @@ def build_payload(data_uri: str) -> dict:
     }
 
 
-def build_prompt(core: str, idx: int) -> str:
-    sentence = STYLE_SENTENCES[idx % len(STYLE_SENTENCES)]
-    return f"{core}{sentence}" if core else sentence
+def build_prompt(core_en: str, core_zh: str, idx: int) -> tuple:
+    sentence_en = STYLE_SENTENCES[idx % len(STYLE_SENTENCES)]
+    sentence_zh = STYLE_SENTENCES_ZH[idx % len(STYLE_SENTENCES_ZH)]
+    prompt_en = f"{core_en}{sentence_en}" if core_en else sentence_en
+    prompt_zh = f"{core_zh}{sentence_zh}" if core_zh else sentence_zh
+    return prompt_en, prompt_zh
 
 
 def list_images(folder: str) -> dict:
@@ -217,13 +236,30 @@ def worker(task):
         resp.raise_for_status()
         data = resp.json()
         raw = data["choices"][0]["message"]["content"]
-        core = sanitize_prompt(raw)
-        prompt = build_prompt(core, idx)
+        
+        # Try to parse JSON from the response
+        try:
+            # Handle possible markdown code blocks
+            json_str = raw
+            if "```json" in raw:
+                json_str = raw.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw:
+                json_str = raw.split("```")[1].split("```")[0].strip()
+            
+            res = json.loads(json_str)
+            core_en = sanitize_prompt(res.get("en", ""))
+            core_zh = sanitize_prompt(res.get("zh", ""))
+        except Exception:
+            # Fallback if JSON parsing fails
+            core_en = sanitize_prompt(raw)
+            core_zh = core_en # Fallback to English if Chinese is missing
+            
+        prompt_en, prompt_zh = build_prompt(core_en, core_zh, idx)
         dt = time.time() - t0
-        return base, prompt, True, dt, ""
+        return base, (prompt_en, prompt_zh), True, dt, ""
     except Exception as e:
         dt = time.time() - t0
-        return base, "", False, dt, str(e)
+        return base, ("", ""), False, dt, str(e)
 
 
 def main():
@@ -242,7 +278,9 @@ def main():
     root = args.root
     cref_dir = os.path.join(root, args.cref)
     sref_dir = os.path.join(root, args.sref)
-    out_path = os.path.join(root, args.out)
+    out_base, out_ext = os.path.splitext(args.out)
+    out_path_en = os.path.join(root, f"{out_base}_en{out_ext}")
+    out_path_zh = os.path.join(root, f"{out_base}_zh{out_ext}")
 
     if not os.path.isdir(cref_dir):
         raise FileNotFoundError(f"cref dir not found: {cref_dir}")
@@ -261,15 +299,18 @@ def main():
         print(f"Matched {len(common)} image pairs.")
         return
 
-    existing = load_existing(out_path)
+    existing_en = load_existing(out_path_en)
+    existing_zh = load_existing(out_path_zh)
     exists_action = "overwrite" if args.overwrite else args.exists_action
-    if existing:
-        print(f"[INFO] Found existing prompts: {len(existing)} in {out_path}")
+    
+    if existing_en or existing_zh:
+        print(f"[INFO] Found existing prompts: EN={len(existing_en)}, ZH={len(existing_zh)}")
         if exists_action == "abort":
             print("[INFO] Output already has content, abort due to exists_action=abort")
             return
         if exists_action == "skip":
-            common = [b for b in common if b not in existing]
+            common = [b for b in common if b not in existing_en or b not in existing_zh]
+    
     if not common:
         print("No new items to process.")
         return
@@ -279,16 +320,20 @@ def main():
     errors = {}
 
     with ctx.Pool(processes=max(1, args.workers), initializer=init_session) as pool:
-        for base, prompt, ok, dt, err in pool.imap_unordered(worker, tasks):
+        for base, prompts, ok, dt, err in pool.imap_unordered(worker, tasks):
             if ok:
-                existing[base] = prompt
-                save_json(out_path, existing)
+                prompt_en, prompt_zh = prompts
+                existing_en[base] = prompt_en
+                existing_zh[base] = prompt_zh
+                save_json(out_path_en, existing_en)
+                save_json(out_path_zh, existing_zh)
                 print(f"[OK] {base} {dt:.2f}s")
             else:
                 errors[base] = err
                 print(f"[ERR] {base} {dt:.2f}s {err}")
 
-    print(f"Saved {len(existing)} prompts to {out_path}")
+    print(f"Saved {len(existing_en)} EN prompts to {out_path_en}")
+    print(f"Saved {len(existing_zh)} ZH prompts to {out_path_zh}")
     if errors:
         print(f"Failed {len(errors)} items")
 

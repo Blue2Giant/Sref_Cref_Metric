@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 python3 /data/LoraPipeline/caption_pipeline/caption_gpt4o_cref_sref.py  \
-    --root /data/benchmark_metrics/sample_1500_bench_cref_sref   --workers 16 \
-    --out prompts.json
+    --root /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref   --workers 16 \
+    --out prompts.json 
 """
 import argparse
 import base64
@@ -69,17 +69,21 @@ SYSTEM_PROMPT = (
 """
 USER_INSTRUCTION = (
     "Write a single-sentence English text-to-image prompt for a new scene reimagined from the content reference. "
-    "The described scene should have more differences from the content picture, rather than being exactly the same as it. It should be more diverse and richer."
     "avoid style/media/camera terms."
 )
 
+
 STYLE_SENTENCES = [
     "Transfer the style into the style reference picture.",
-    "Transfer the style into the second picture.",
     "Transfer the style into the style reference image.",
     "Transfer the style to the style reference picture.",
-    "Transfer the style to the second picture.",
     "Apply the style to the style reference picture.",
+    "Adopt the style from the style reference picture.",
+    "Embrace the aesthetic of the style reference picture.",
+    "Incorporate the style from the style reference image.",
+    "Reflect the style of the style reference picture.",
+    "Capture the essence of the style reference image.",
+    "Utilize the style from the style reference picture.",
 ]
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}

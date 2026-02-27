@@ -1,35 +1,46 @@
 """
 python image_compare_web.py \
-  --root /mnt/jfs/bench-bucket/sref_bench/sample_1500_bench_cref_sref/ \
-  --output-dir /mnt/jfs/bench-bucket/sref_bench/sample_1500_bench_sref/compare \
+  --root /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref \
+  --output-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref/label \
   --output-name selections.jsonl \
   --images-per-row 2 \
   --only-unlabeled \
   --host 0.0.0.0 \
   --port 7860 \
-  --meta-json /mnt/jfs/bench-bucket/sref_bench/sample_1500_bench_sref/instruction.json
+  --meta-json /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref/prompts.json
+python image_compare_web.py \
+  --root /data/benchmark_metrics/sample_800 \
+  --output-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref/label \
+  --output-name selections.jsonl \
+  --images-per-row 2 \
+  --only-unlabeled \
+  --host 0.0.0.0 \
+  --port 7860 \
+  --meta-json /data/benchmark_metrics/sample_800/prompts.json
 
 python image_compare_web.py \
   --root /data/benchmark_metrics/sample_1500_bench_cref_sref \
-  --output-dir /data/benchmark_metrics/sample_1500_bench_cref_sref/compare \
+  --output-dir /data/benchmark_metrics/sample_800_bench_cref_sref/compare \
   --output-name selections.jsonl \
   --images-per-row 2 \
   --only-unlabeled \
   --host 0.0.0.0 \
   --port 7860 \
-  --meta-json /data/benchmark_metrics/sample_1500_bench_cref_sref/prompts.json
+  --meta-json /data/benchmark_metrics/sample_800_bench_cref_sref/prompts.json
 """
 import argparse
 import json
 import mimetypes
 import os
+from collections import OrderedDict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 
-HTML_PAGE = """<!doctype html>
+LABEL_HTML_PAGE = """<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
@@ -132,8 +143,9 @@ HTML_PAGE = """<!doctype html>
         });
 
         const img = document.createElement('img');
-        img.src = item.img_url;
+        img.src = item.thumb_url || item.img_url;
         img.loading = 'lazy';
+        img.decoding = 'async';
         img.alt = '';
 
         const label = document.createElement('div');
@@ -205,6 +217,174 @@ HTML_PAGE = """<!doctype html>
     window.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
 
     refresh();
+  </script>
+</body>
+</html>
+"""
+
+ALL_HTML_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Image Pairs</title>
+  <style>
+    :root { --fg:#111; --muted:#666; --bg:#fff; --border:#ddd; }
+    body { margin: 0; font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color: var(--fg); background: var(--bg); }
+    header { position: sticky; top: 0; background: var(--bg); border-bottom: 1px solid var(--border); padding: 10px 12px; z-index: 10; }
+    .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .grow { flex: 1; min-width: 220px; }
+    .title { font-size: 16px; font-weight: 700; user-select: text; }
+    .status { color: var(--muted); font-size: 13px; user-select: text; }
+    main { padding: 12px; }
+    .pair { border: 1px solid var(--border); border-radius: 12px; padding: 10px; background: #fff; margin-bottom: 12px; }
+    .pairHead { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+    .basename { font-size: 14px; font-weight: 700; user-select: text; }
+    .meta { color: var(--muted); font-size: 13px; white-space: pre-wrap; user-select: text; flex: 1; min-width: 200px; }
+    .grid { display: grid; gap: 10px; grid-template-columns: repeat(var(--cols), minmax(180px, 1fr)); margin-top: 10px; }
+    .card { border: 1px solid var(--border); border-radius: 10px; padding: 8px; background: #fff; }
+    .card img { width: 100%; height: auto; display: block; border-radius: 8px; background: #000; }
+    .label { margin-top: 6px; font-size: 12px; color: var(--muted); user-select: text; white-space: pre-wrap; }
+    .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.9); display: none; align-items: center; justify-content: center; z-index: 999; }
+    .modal.open { display: flex; }
+    .modal img { max-width: 96vw; max-height: 92vh; }
+    .modal .bar { position: fixed; top: 10px; right: 10px; display: flex; gap: 10px; align-items: center; }
+    .modal .bar a, .modal .bar button { color: #fff; background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.22); border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="row">
+      <div class="grow">
+        <div class="title">Image Pairs</div>
+        <div class="status" id="status"></div>
+      </div>
+      <div class="status"><a href="/label" style="color:inherit; text-decoration:none;">切换到标注模式</a></div>
+    </div>
+  </header>
+  <main>
+    <div id="list"></div>
+    <div id="sentinel" style="height: 1px;"></div>
+  </main>
+
+  <div class="modal" id="modal">
+    <div class="bar">
+      <a id="openOrig" href="#" target="_blank" rel="noreferrer">打开原图</a>
+      <button id="closeModal">关闭</button>
+    </div>
+    <img id="modalImg" alt="" />
+  </div>
+
+  <script>
+    const state = { offset: 0, limit: 40, loading: false, done: false, total: 0, cols: 2, thumbW: 640 };
+    function $(id) { return document.getElementById(id); }
+
+    async function api(path) {
+      const res = await fetch(path);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data && data.error ? data.error : ('HTTP ' + res.status));
+      return data;
+    }
+
+    function setStatus() {
+      const s = $('status');
+      const loaded = state.offset;
+      const total = state.total || 0;
+      if (state.done) s.textContent = `已加载 ${loaded}/${total}`;
+      else s.textContent = `已加载 ${loaded}/${total}，继续加载中...`;
+    }
+
+    function openModal(imgUrl) {
+      $('modal').classList.add('open');
+      $('modalImg').src = imgUrl;
+      $('openOrig').href = imgUrl;
+    }
+
+    function closeModal() {
+      $('modal').classList.remove('open');
+      $('modalImg').src = '';
+    }
+
+    $('closeModal').addEventListener('click', () => closeModal());
+    $('modal').addEventListener('click', (e) => { if (e.target === $('modal')) closeModal(); });
+    window.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
+
+    function renderPair(pair) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'pair';
+
+      const head = document.createElement('div');
+      head.className = 'pairHead';
+
+      const basename = document.createElement('div');
+      basename.className = 'basename';
+      basename.textContent = pair.basename || '';
+
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = (pair.meta_values || []).map(String).join('\\n');
+
+      head.appendChild(basename);
+      head.appendChild(meta);
+      wrapper.appendChild(head);
+
+      const grid = document.createElement('div');
+      grid.className = 'grid';
+
+      (pair.items || []).forEach(item => {
+        const card = document.createElement('div');
+        card.className = 'card';
+
+        const img = document.createElement('img');
+        img.src = item.thumb_url || item.img_url;
+        img.loading = 'lazy';
+        img.decoding = 'async';
+        img.alt = '';
+        img.addEventListener('click', () => openModal(item.img_url));
+
+        const label = document.createElement('div');
+        label.className = 'label';
+        label.textContent = item.model_id + '\\n' + item.file_name;
+
+        card.appendChild(img);
+        card.appendChild(label);
+        grid.appendChild(card);
+      });
+
+      wrapper.appendChild(grid);
+      $('list').appendChild(wrapper);
+    }
+
+    async function loadMore() {
+      if (state.loading || state.done) return;
+      state.loading = true;
+      try {
+        const payload = await api(`/api/all?offset=${state.offset}&limit=${state.limit}&thumb_w=${state.thumbW}`);
+        if (state.offset === 0) {
+          state.total = payload.total || 0;
+          state.cols = payload.images_per_row || 2;
+          document.documentElement.style.setProperty('--cols', String(state.cols));
+        }
+        (payload.items || []).forEach(renderPair);
+        state.offset += (payload.items || []).length;
+        if (!payload.items || payload.items.length === 0 || state.offset >= state.total) state.done = true;
+        setStatus();
+      } catch (e) {
+        $('status').textContent = String(e && e.message ? e.message : e);
+        state.done = true;
+      } finally {
+        state.loading = false;
+      }
+    }
+
+    const io = new IntersectionObserver((entries) => {
+      for (const ent of entries) {
+        if (ent.isIntersecting) loadMore();
+      }
+    }, { rootMargin: '1200px' });
+    io.observe($('sentinel'));
+
+    loadMore();
   </script>
 </body>
 </html>
@@ -349,17 +529,22 @@ class CompareModel:
             return v
         return [v]
 
-    def items_for(self, basename):
+    def items_for(self, basename, thumb_w=None):
         items = []
         for model_id in self.model_ids:
             for path in self.per_model.get(model_id, {}).get(basename, []):
                 rel_path = str(path.resolve().relative_to(self.root_dir))
+                img_url = "/img?path=" + quote(rel_path)
+                thumb_url = img_url
+                if thumb_w:
+                    thumb_url = "/thumb?path=" + quote(rel_path) + "&w=" + str(int(thumb_w))
                 items.append(
                     {
                         "model_id": model_id,
                         "file_name": path.name,
                         "rel_path": rel_path,
-                        "img_url": "/img?path=" + quote(rel_path),
+                        "img_url": img_url,
+                        "thumb_url": thumb_url,
                     }
                 )
         return items
@@ -371,9 +556,30 @@ class CompareModel:
             "index": self.index,
             "total": len(self.basenames),
             "images_per_row": self.images_per_row,
-            "items": self.items_for(basename),
+            "items": self.items_for(basename, thumb_w=768),
             "selected": [],
             "meta_values": self.meta_values(basename),
+        }
+
+    def list_payload(self, offset, limit, thumb_w=None):
+        offset = max(int(offset), 0)
+        limit = max(int(limit), 1)
+        end = min(offset + limit, len(self.basenames))
+        items = []
+        for basename in self.basenames[offset:end]:
+            items.append(
+                {
+                    "basename": basename,
+                    "meta_values": self.meta_values(basename),
+                    "items": self.items_for(basename, thumb_w=thumb_w),
+                }
+            )
+        return {
+            "offset": offset,
+            "limit": limit,
+            "total": len(self.basenames),
+            "images_per_row": self.images_per_row,
+            "items": items,
         }
 
     def save_current(self, basename, selected_rel_paths, overwrite):
@@ -398,6 +604,8 @@ class CompareModel:
 
 class Handler(BaseHTTPRequestHandler):
     model = None
+    thumb_cache = OrderedDict()
+    thumb_cache_max_items = 1024
 
     def _json(self, status, data):
         payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -415,6 +623,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _bytes(self, status, data, content_type):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _read_json(self):
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw = self.rfile.read(length) if length > 0 else b"{}"
@@ -426,10 +641,32 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/":
-            return self._text(HTTPStatus.OK, HTML_PAGE)
+            return self._text(HTTPStatus.OK, ALL_HTML_PAGE)
+        if parsed.path == "/label":
+            return self._text(HTTPStatus.OK, LABEL_HTML_PAGE)
         if parsed.path == "/api/current":
             try:
                 payload = self.model.current_payload()
+                return self._json(HTTPStatus.OK, payload)
+            except Exception as e:
+                return self._json(HTTPStatus.BAD_REQUEST, {"error": str(e)})
+        if parsed.path == "/api/all":
+            qs = parse_qs(parsed.query)
+            try:
+                offset = int(qs.get("offset", ["0"])[0])
+            except Exception:
+                offset = 0
+            try:
+                limit = int(qs.get("limit", ["40"])[0])
+            except Exception:
+                limit = 40
+            try:
+                thumb_w = int(qs.get("thumb_w", ["640"])[0])
+            except Exception:
+                thumb_w = 640
+            thumb_w = max(128, min(2048, thumb_w))
+            try:
+                payload = self.model.list_payload(offset=offset, limit=limit, thumb_w=thumb_w)
                 return self._json(HTTPStatus.OK, payload)
             except Exception as e:
                 return self._json(HTTPStatus.BAD_REQUEST, {"error": str(e)})
@@ -449,6 +686,79 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            except Exception as e:
+                return self._json(HTTPStatus.BAD_REQUEST, {"error": str(e)})
+        if parsed.path == "/thumb":
+            qs = parse_qs(parsed.query)
+            rel = qs.get("path", [""])[0]
+            rel = unquote(rel)
+            try:
+                w = int(qs.get("w", ["640"])[0])
+            except Exception:
+                w = 640
+            w = max(128, min(2048, w))
+            try:
+                p = (self.model.root_dir / rel).resolve()
+                if not str(p).startswith(str(self.model.root_dir) + os.sep):
+                    return self._json(HTTPStatus.BAD_REQUEST, {"error": "非法路径"})
+                if not p.exists() or not p.is_file():
+                    return self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                st = p.stat()
+                etag = f'W/"{st.st_mtime_ns}-{st.st_size}-{w}"'
+                if self.headers.get("If-None-Match") == etag:
+                    self.send_response(HTTPStatus.NOT_MODIFIED)
+                    self.send_header("ETag", etag)
+                    self.send_header("Cache-Control", "public, max-age=3600")
+                    self.end_headers()
+                    return
+                key = (str(p), w, st.st_mtime_ns)
+                cached = self.thumb_cache.get(key)
+                if cached is not None:
+                    self.thumb_cache.move_to_end(key)
+                    data = cached
+                else:
+                    try:
+                        from PIL import Image
+                    except Exception:
+                        data = p.read_bytes()
+                        content_type, _ = mimetypes.guess_type(str(p))
+                        content_type = content_type or "application/octet-stream"
+                        self.send_response(HTTPStatus.OK)
+                        self.send_header("Content-Type", content_type)
+                        self.send_header("Content-Length", str(len(data)))
+                        self.send_header("ETag", etag)
+                        self.send_header("Cache-Control", "public, max-age=3600")
+                        self.end_headers()
+                        self.wfile.write(data)
+                        return
+                    img = Image.open(str(p))
+                    img.load()
+                    if img.mode not in ("RGB", "L"):
+                        img = img.convert("RGB")
+                    elif img.mode == "L":
+                        img = img.convert("RGB")
+                    iw, ih = img.size
+                    m = max(iw, ih)
+                    if m > w:
+                        scale = w / float(m)
+                        nw = max(1, int(iw * scale))
+                        nh = max(1, int(ih * scale))
+                        img = img.resize((nw, nh), Image.LANCZOS)
+                    buf = BytesIO()
+                    img.save(buf, format="JPEG", quality=85, optimize=True, progressive=True)
+                    data = buf.getvalue()
+                    self.thumb_cache[key] = data
+                    self.thumb_cache.move_to_end(key)
+                    while len(self.thumb_cache) > self.thumb_cache_max_items:
+                        self.thumb_cache.popitem(last=False)
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "public, max-age=3600")
                 self.end_headers()
                 self.wfile.write(data)
                 return

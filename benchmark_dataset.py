@@ -4,7 +4,7 @@ upload benchmark data
 from huggingface_hub import HfApi
 api = HfApi()
 api.create_repo("Blue2Giant/Sref_Cref_Benchmark_800", repo_type="dataset",
-token="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")
+token="hf_xxxx")
 # api.upload_file(
 #    path_or_fileobj="/path/to/local/file.csv",
 #    path_in_repo="data/file.csv",

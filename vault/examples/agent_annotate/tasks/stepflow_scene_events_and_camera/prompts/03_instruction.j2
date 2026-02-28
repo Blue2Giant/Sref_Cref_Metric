@@ -1,0 +1,145 @@
+# Role
+你是一位精通 **AI图片编辑模型指令工程 (Prompt Engineering)** 和 **电影语言** 的数据合成专家。
+
+你的任务是将结构化的分析数据（Phase 2 JSON）与视频起始终结帧图片相结合，通过深度的思维链，一步接一步，生成用于训练图像编辑模型的高质量指令。
+
+# Input Data
+
+
+我将提供两张电影关键帧图片：
+1. **Source Image (起始帧, Picture 1)**
+2. **Target Image (结束帧, Picture 2)**
+3. 上一个环节生成的 JSON 数据，包含以下关键字段：
+    *  `target_frame_composition`: 目标图片的静态摄影描述。
+    *  `camera`: 包含相机的运动描述和标准化参数。
+    *  `scene_events`: 场景内发生的真实事件。
+
+**Input JSON:**
+```json
+{{ phase2_json_output }}
+```
+
+# 生成编辑指令的三大黄金法则 (必须严格遵守)
+
+1.  **下达指令，而非比较描述 (Imperative, Not Comparative)**
+    *   指令仅描述**需执行的操作**或**最终期望的状态**。严禁提及源图像的状态（如“从...变成...”）。
+    *   *正确*: "让那个男人向右看。" / "切换到特写镜头。"
+2.  **具体明确，避免抽象 (Concrete & Visual)**
+    *   严禁使用“营造氛围”、“表达情绪”、“叙事意图”等虚词。严禁“...，营造出更凝重的视觉效果。”, "，传递出紧张或决断的情绪。"
+3.  **断言事实，杜绝推测 (Assertive & Factual)**
+    *   严禁使用“可能”、“似乎”。输出即为事实。
+
+---
+
+# Task Definition
+
+请基于 Input Data，依次按照下面的思考步骤进行推理和标注
+
+## Step 1: 目标图像描述 (Target Caption Generation)
+**目标**：生成一段详细的、独立的视觉描述，用于描述 **最终生成的图片 (Target Image)** 长什么样。
+**生成逻辑**：
+1.  **基准**：以 `target_frame_composition` 为核心框架。
+2.  **融合事件**：必须包含 `scene_events` 中描述的**最终状态**（例如：事件是“转头”，Caption里要写“面部朝向xx”）。
+3.  **过滤视觉副作用**：
+    *   **保留**：影响画面样貌的副作用（如：背景虚化、光影变暗、运动模糊）。
+    *   **剔除**：与最终画面内容无关的过程描述（如：某人“出画/被裁切”——既然不在画里了，就不要在 Caption 里提他）。
+
+**输出要求**：
+*   **English & Chinese**: 包含详细英文描述和中文描述。
+
+
+## Step 2: Camera Dynamics Synthesis 
+
+任务：应用生成编辑指令的三大法则，生成一段通顺的中文摄影镜头语言描述。
+来源：整合`standardized_camera_action` + `camera_motion` + `frame_events` 提到的所有信息。
+
+
+## Step 3: Narrative Event Refinement
+
+任务：将上一个环节描述的场景事件变化，写为符合黄金法则的、有画面感的叙事描述。
+来源：scene_events。
+逻辑：
+- 依次阅读原始 scene_events 中的每个事件，观察source图片target图片对应部分
+- 改写为符合黄金法则的、有画面感的独立指令。如果指令中包含“无任何变化”，则忽略。
+- 总结所有指令，写一个完整的叙事指令。对于同一个主体的指令，要合并在一起，不要重复。忽略包含“无任何变化”的指令
+
+
+Step 4: Dominance Analysis & Strategy (主导性分析与合并)
+任务：分析 Step 2 (相机) 和 Step 3 (事件) 谁更重要？然后总结合并上面的相机与场景事件描述(`step2_camera_synthesis`和`step3_narrative_event_synthesis["summary]`)
+判断逻辑：
+- Camera Dominant: 画面主要是运镜变化（如：希区柯克变焦），场景内人物几乎没动。 -> 策略：指令应侧重摄影术语。
+- Event Dominant: 相机几乎没动（或只是简单的跟拍），主要是人在表演。-> 策略：指令应侧重动作描述。
+- Balanced: 两者都有显著变化。-> 策略：指令需使用“同时/随着”句式连接两者。
+
+
+
+## Step 5: 编辑指令生成 (Editing Instruction Generation)
+**目标**：生成引导 AI 将“源图”修改为“目标图”的指令。
+**核心原则**：需要同时包含中文和英文两个版本，根据主导性分析结果，选择合适的指令风格。
+
+再次强调对指令的要求：
+1.  **下达指令，而非比较描述 (Imperative, Not Comparative)**
+2.  **具体明确，避免抽象 (Concrete & Visual)**
+3.  **断言事实，杜绝推测 (Assertive & Factual)**
+
+为了提高模型对不同长度、不同侧重指令的泛化能力，我设计了4种不同的口吻和侧重。
+
+- director_holistic: 偏向导演视角，兼顾摄影与叙事，口吻专业而精确；如果是典型的拍摄手法，就点名这个手法。
+- user_natural: 偏向普通用户，口语化，自然流畅
+- narrative: 先描述发生了什么事，再强调画面效果。
+- cinematographer_technical: 侧重摄影技巧，喜欢用对应的专业术语。
+
+不同主导性时，请参考上面的角色口吻，依次生成对应的选中的指令风格。
+
+- Camera Dominant: `director_holistic`, `user_natural`, `cinematographer_technical`
+- Event Dominant:  `director_holistic`, `user_natural`, `narrative`
+- Balanced: `director_holistic`, `user_natural`, `narrative`, `cinematographer_technical`
+
+---
+
+# Output Format
+请严格输出以下 JSON 格式。确保每个 Key 都有 `en` 和 `zh` 两个版本。
+
+```json
+{
+  "step1_visual_grounding": {
+    "en": "A detailed caption strictly describing the final visual state...",
+    "zh": "一段详细描述最终画面内容的中文文本...",
+  },
+  "step2_camera_synthesis": "一段通顺的中文摄影镜头语言描述",
+  "step3_narrative_event_synthesis": {
+    "events": [
+      "叙事、明确、没有比较、有画面感的指令",
+      ... // 依次改写 scene_events 中的每个事件，变成独立的指令。如果指令中包含“无任何变化。”，则忽略。
+    ],
+    "summary": "综合上面所有事件，写一个完整的叙事指令；如果所有事件都包含“无任何变化”，则为空文本。"
+  },
+  "step4_dominance_analysis": {
+    "reasoning": "简要分析什么占主导",
+    "primary_factor": "camera | event | balanced",
+    "merged_instructions": "按照对应策略综合上面的相机与场景事件描述，写一个完整的指令"
+  },
+  "step5_final_instructions": [
+    {
+      "style": "user_natural",
+      "en": "...",
+      "zh": "..."
+    },
+    {
+      "style": "director_holistic",
+      "en": "...",
+      "zh": "..."
+    },
+    {
+      "style": "narrative",
+      "en": "...",
+      "zh": "..."
+    },
+    {
+      "style": "cinematographer_technical",
+      "en": "...",
+      "zh": "..."
+    }
+  ]
+}
+```

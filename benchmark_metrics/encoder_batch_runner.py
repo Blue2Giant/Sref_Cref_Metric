@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import json
+import os
+import re
+import multiprocessing as mp
+from typing import Dict, Any, List, Tuple
+
+import torch
+from PIL import Image
+from transformers import AutoImageProcessor, AutoModel, AutoConfig
+from transformers import CLIPProcessor, CLIPModel, CLIPImageProcessor, CLIPVisionModelWithProjection
+from transformers import AutoModelForCausalLM
+
+
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def read_image(path: str) -> Image.Image:
+    return Image.open(path).convert("RGB")
+
+
+def sort_key(name: str):
+    base = os.path.splitext(os.path.basename(name))[0]
+    nums = re.findall(r"\d+", base)
+    if nums:
+        return int(nums[0])
+    return base
+
+
+def list_images(folder: str) -> Dict[str, str]:
+    items = {}
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path):
+            continue
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in IMG_EXTS:
+            continue
+        items[os.path.splitext(name)[0]] = path
+    return items
+
+
+def save_json(path: str, data: Dict[str, Any]) -> None:
+    ordered = dict(sorted(data.items(), key=lambda x: sort_key(x[0])))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(ordered, f, ensure_ascii=False, indent=2)
+
+
+def load_json(path: str) -> Dict[str, Any]:
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+@torch.no_grad()
+def dinov2_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, device: str, size: int) -> float:
+    inputs_a = processor(
+        images=img_a, return_tensors="pt",
+        do_resize=True, size={"height": size, "width": size},
+        do_center_crop=False
+    )
+    inputs_b = processor(
+        images=img_b, return_tensors="pt",
+        do_resize=True, size={"height": size, "width": size},
+        do_center_crop=False
+    )
+    tokens_a = model(pixel_values=inputs_a["pixel_values"].to(device)).last_hidden_state[:, 1:, :]
+    tokens_b = model(pixel_values=inputs_b["pixel_values"].to(device)).last_hidden_state[:, 1:, :]
+    vec_a = tokens_a.mean(dim=1)
+    vec_b = tokens_b.mean(dim=1)
+    vec_a = vec_a / vec_a.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    vec_b = vec_b / vec_b.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    return float((vec_a * vec_b).sum(dim=-1).item())
+
+
+def cas_mean_std(feat, eps=1e-5):
+    size = feat.size()
+    N, C = size[:2]
+    feat_var = feat.view(N, C, -1).var(dim=2) + eps
+    feat_std = feat_var.sqrt().view(N, C, 1)
+    feat_mean = feat.view(N, C, -1).mean(dim=2).view(N, C, 1)
+    return feat_mean, feat_std
+
+
+@torch.no_grad()
+def cas_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, device: str) -> float:
+    if img_a.size != (512, 512):
+        img_a = img_a.resize((512, 512))
+    if img_b.size != (512, 512):
+        img_b = img_b.resize((512, 512))
+    inputs1 = processor(images=img_a, return_tensors="pt").to(device)
+    outputs1 = model(**inputs1)
+    feat1 = outputs1.last_hidden_state
+    mean1, std1 = cas_mean_std(feat1.transpose(-1, -2))
+    size1 = feat1.transpose(-1, -2).size()
+    norm1 = (feat1.transpose(-1, -2) - mean1.expand(size1)) / std1.expand(size1)
+
+    inputs2 = processor(images=img_b, return_tensors="pt").to(device)
+    outputs2 = model(**inputs2)
+    feat2 = outputs2.last_hidden_state
+    mean2, std2 = cas_mean_std(feat2.transpose(-1, -2))
+    size2 = feat2.transpose(-1, -2).size()
+    norm2 = (feat2.transpose(-1, -2) - mean2.expand(size2)) / std2.expand(size2)
+    return float(torch.mean((norm2 - norm1) ** 2).item())
+
+
+@torch.no_grad()
+def oneig_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, device: str, dtype) -> float:
+    inputs_a = processor(images=img_a, return_tensors="pt").pixel_values.to(device, dtype=dtype)
+    inputs_b = processor(images=img_b, return_tensors="pt").pixel_values.to(device, dtype=dtype)
+    embeds_a = model(inputs_a).image_embeds
+    embeds_b = model(inputs_b).image_embeds
+    embeds_a = torch.nn.functional.normalize(embeds_a, p=2, dim=-1)
+    embeds_b = torch.nn.functional.normalize(embeds_b, p=2, dim=-1)
+    return float((embeds_a * embeds_b).sum(dim=-1).item())
+
+
+@torch.no_grad()
+def clip_image_text_similarity(image: Image.Image, caption: str, processor: CLIPProcessor, model: CLIPModel, device: str) -> float:
+    inputs = processor(text=[caption], images=image, return_tensors="pt", padding=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    outputs = model(**inputs)
+    image_embeds = outputs.image_embeds
+    text_embeds = outputs.text_embeds
+    image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    return float((image_embeds * text_embeds).sum(dim=-1).item())
+
+
+def build_tasks_pair(dir_a: str, dir_b: str) -> List[Tuple[str, str, str]]:
+    map_a = list_images(dir_a)
+    map_b = list_images(dir_b)
+    keys = sorted(set(map_a.keys()) & set(map_b.keys()), key=sort_key)
+    return [(k, map_a[k], map_b[k]) for k in keys]
+
+
+def build_tasks_clipcap(image_dir: str, prompt_json: str) -> List[Tuple[str, str, str]]:
+    with open(prompt_json, "r", encoding="utf-8") as f:
+        prompt_map = json.load(f)
+    if not isinstance(prompt_map, dict):
+        raise ValueError("prompt_json must be a dict")
+    image_map = list_images(image_dir)
+    keys = sorted(set(image_map.keys()) & set(prompt_map.keys()), key=sort_key)
+    return [(k, image_map[k], str(prompt_map[k])) for k in keys]
+
+
+def build_tasks_onealign(image_dir: str) -> List[Tuple[str, str]]:
+    image_map = list_images(image_dir)
+    keys = sorted(image_map.keys(), key=sort_key)
+    return [(k, image_map[k]) for k in keys]
+
+
+def worker_pair(encoder: str, args_dict: dict, tasks: List[Tuple[str, str, str]], out_queue: mp.Queue):
+    device = args_dict["device"]
+    if encoder == "dinov2":
+        processor = AutoImageProcessor.from_pretrained(args_dict["model"])
+        model = AutoModel.from_pretrained(args_dict["model"]).to(device)
+        model.eval()
+        size = args_dict["size"]
+        for k, p1, p2 in tasks:
+            img_a = read_image(p1)
+            img_b = read_image(p2)
+            score = dinov2_similarity(img_a, img_b, processor, model, device, size)
+            out_queue.put((k, score))
+        return
+    if encoder == "cas":
+        config = AutoConfig.from_pretrained(args_dict["model"])
+        config.output_hidden_states = True
+        processor = AutoImageProcessor.from_pretrained(args_dict["model"])
+        model = AutoModel.from_pretrained(args_dict["model"], config=config).to(device)
+        model.eval()
+        for k, p1, p2 in tasks:
+            img_a = read_image(p1)
+            img_b = read_image(p2)
+            score = cas_similarity(img_a, img_b, processor, model, device)
+            out_queue.put((k, score))
+        return
+    if encoder == "oneig":
+        processor = CLIPImageProcessor()
+        model = CLIPVisionModelWithProjection.from_pretrained(args_dict["model"]).to(device, dtype=args_dict["dtype"])
+        model.eval()
+        for k, p1, p2 in tasks:
+            img_a = read_image(p1)
+            img_b = read_image(p2)
+            score = oneig_similarity(img_a, img_b, processor, model, device, args_dict["dtype"])
+            out_queue.put((k, score))
+        return
+    raise ValueError(f"Unsupported encoder: {encoder}")
+
+
+def worker_clipcap(args_dict: dict, tasks: List[Tuple[str, str, str]], out_queue: mp.Queue):
+    device = args_dict["device"]
+    processor = CLIPProcessor.from_pretrained(args_dict["model"])
+    model = CLIPModel.from_pretrained(args_dict["model"]).to(device)
+    model.eval()
+    for k, img_path, caption in tasks:
+        img = read_image(img_path)
+        score = clip_image_text_similarity(img, caption, processor, model, device)
+        out_queue.put((k, score))
+
+
+def worker_onealign(args_dict: dict, tasks: List[Tuple[str, str]], out_queue: mp.Queue):
+    model = AutoModelForCausalLM.from_pretrained(
+        args_dict["model"],
+        trust_remote_code=True,
+        attn_implementation="eager",
+        torch_dtype=args_dict["dtype"],
+        device_map="auto",
+    )
+    for k, img_path in tasks:
+        img = read_image(img_path)
+        score = model.score([img], task_=args_dict["task"], input_="image")
+        if isinstance(score, (list, tuple)):
+            score = score[0]
+        if hasattr(score, "item"):
+            score = score.item()
+        out_queue.put((k, float(score)))
+
+
+def run_batch(tasks, out_path: str, overwrite: bool, worker_fn, args_dict):
+    results = {}
+    if (not overwrite) and os.path.isfile(out_path):
+        results = load_json(out_path)
+        tasks = [t for t in tasks if t[0] not in results]
+    if not tasks:
+        save_json(out_path, results)
+        return
+    num_procs = max(1, int(args_dict["num_procs"]))
+    chunk_size = (len(tasks) + num_procs - 1) // num_procs
+    q = mp.Queue()
+    workers = []
+    for i in range(num_procs):
+        sub = tasks[i * chunk_size : (i + 1) * chunk_size]
+        if not sub:
+            continue
+        p = mp.Process(target=worker_fn, args=(args_dict.get("encoder"), args_dict, sub, q)) if args_dict.get("encoder") else mp.Process(target=worker_fn, args=(args_dict, sub, q))
+        p.start()
+        workers.append(p)
+    total = len(tasks)
+    done = 0
+    while done < total:
+        try:
+            k, score = q.get(timeout=5)
+            results[k] = score
+            done += 1
+        except Exception:
+            if not any(p.is_alive() for p in workers) and q.empty():
+                break
+    for p in workers:
+        p.join()
+    save_json(out_path, results)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Batch runner for image encoders")
+    sub = ap.add_subparsers(dest="mode", required=True)
+
+    ap_pair = sub.add_parser("pair")
+    ap_pair.add_argument("--encoder", choices=["dinov2", "cas", "oneig"], required=True)
+    ap_pair.add_argument("--dir_a", required=True)
+    ap_pair.add_argument("--dir_b", required=True)
+    ap_pair.add_argument("--out_json", required=True)
+    ap_pair.add_argument("--model", required=True)
+    ap_pair.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap_pair.add_argument("--size", type=int, default=518)
+    ap_pair.add_argument("--dtype", default="bfloat16")
+    ap_pair.add_argument("--num_procs", type=int, default=4)
+    ap_pair.add_argument("--overwrite", action="store_true")
+
+    ap_clip = sub.add_parser("clip_cap")
+    ap_clip.add_argument("--image_dir", required=True)
+    ap_clip.add_argument("--prompt_json", required=True)
+    ap_clip.add_argument("--out_json", required=True)
+    ap_clip.add_argument("--model", default="/mnt/jfs/model_zoo/clip-vit-large-patch14")
+    ap_clip.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap_clip.add_argument("--num_procs", type=int, default=4)
+    ap_clip.add_argument("--overwrite", action="store_true")
+
+    ap_one = sub.add_parser("onealign")
+    ap_one.add_argument("--image_dir", required=True)
+    ap_one.add_argument("--out_json", required=True)
+    ap_one.add_argument("--model", default="/mnt/jfs/model_zoo/one-align")
+    ap_one.add_argument("--task", default="aesthetics")
+    ap_one.add_argument("--dtype", default="float16")
+    ap_one.add_argument("--num_procs", type=int, default=4)
+    ap_one.add_argument("--overwrite", action="store_true")
+
+    args = ap.parse_args()
+
+    if args.mode == "pair":
+        dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
+        tasks = build_tasks_pair(args.dir_a, args.dir_b)
+        args_dict = {
+            "encoder": args.encoder,
+            "model": args.model,
+            "device": args.device,
+            "size": args.size,
+            "dtype": dtype,
+            "num_procs": args.num_procs,
+        }
+        run_batch(tasks, args.out_json, args.overwrite, worker_pair, args_dict)
+        return
+
+    if args.mode == "clip_cap":
+        tasks = build_tasks_clipcap(args.image_dir, args.prompt_json)
+        args_dict = {
+            "model": args.model,
+            "device": args.device,
+            "num_procs": args.num_procs,
+        }
+        run_batch(tasks, args.out_json, args.overwrite, worker_clipcap, args_dict)
+        return
+
+    if args.mode == "onealign":
+        dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
+        tasks = build_tasks_onealign(args.image_dir)
+        args_dict = {
+            "model": args.model,
+            "task": args.task,
+            "dtype": dtype,
+            "num_procs": args.num_procs,
+        }
+        run_batch(tasks, args.out_json, args.overwrite, worker_onealign, args_dict)
+        return
+
+
+if __name__ == "__main__":
+    main()

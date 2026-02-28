@@ -32,31 +32,50 @@ JPEG_QUALITY = 85
 
 SYSTEM_PROMPT = """
 You are a professional image-synthesis prompt generator.
-Your task is to analyze the reference image and create one JSON object containing exactly two ready-to-use image-generation instructions: one in Chinese and one in English.
-Each instruction must be a single detailed caption that an image generator can use directly.
+Your task is to analyze the reference image and create one JSON object containing **exactly 10 distinct and diverse** image-generation scenarios based on the image content.
+For each scenario, provide a detailed caption in both Chinese and English.
+
+If it is a scene, you can add some characters or objects to interact within the scene, or change the perspective of the scene.
+If there are multiple subjects in the picture, you can have them interact with each other or just focus on one of them for your imagination.
+If there is a clear subject in the picture, then take this subject as the theme and imagine various actions, behaviors, positions, and environments in which it is located.
+
 Important rules:
+- **Diversity is key**: The 10 scenarios must be significantly different from each other (e.g., different actions, environments, lighting, styles, or perspectives).
 - The synthesis must not look like pasted or cut-out elements. The result must appear as a newly rendered, seamless picture.
-- The subject from the reference image must interact naturally (e.g., holding, sitting on, standing next to, walking through, leaning against).
-- Ensure diversity: vary actions, poses, and arrangements so that the instructions are not just static placement but describe dynamic or meaningful interactions.
-- The final image must associate with the reference image.
+- The subject from the reference image must interact naturally with the new environment or objects.
+- The final image must associate with the reference image but offer a fresh perspective or story.
+
 Output format:
 Return only valid JSON, no extra explanation. The JSON must have this structure:
 {
-"instructions": [
-    {"language": "CN", "caption": "中文合成指令"},
-    {"language": "EN", "caption": "English synthesis instruction"}
-]
+  "scenarios": [
+    {
+      "id": 1,
+      "CN": "Chinese caption for scenario 1",
+      "EN": "English caption for scenario 1"
+    },
+    ...
+    {
+      "id": 10,
+      "CN": "Chinese caption for scenario 10",
+      "EN": "English caption for scenario 10"
+    }
+  ]
 }
+You MUST give me exactly 10 diverse scenarios!
 """
 
 USER_INSTRUCTION = """
 You will be provided with a reference image.
 Task:
-Analyze the image and return exactly ONE JSON object with the key "instructions". 
-Its value must be an array of exactly two objects:
-1. A Chinese instruction ("language": "CN")
-2. An English instruction ("language": "EN")
-Each instruction must follow the system rules to generate one seamless, realistic photograph.
+Analyze the image and return exactly ONE JSON object with the key "scenarios". 
+Its value must be an array of exactly 10 objects, where each object represents a unique imagination/scenario.
+Each object must contain:
+1. "id": integer ID (1-10)
+2. "CN": Chinese instruction
+3. "EN": English instruction
+
+Ensure the 10 scenarios are highly diverse and creative.
 """
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
@@ -186,33 +205,38 @@ def worker(task):
         
         # Parse JSON
         try:
-            res = json.loads(raw)
-            instructions = res.get("instructions", [])
-            prompt_cn = ""
-            prompt_en = ""
+            # Clean markdown code blocks if present
+            raw_clean = raw
+            if "```json" in raw:
+                raw_clean = raw.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw:
+                raw_clean = raw.split("```")[1].split("```")[0].strip()
+
+            res = json.loads(raw_clean)
+            scenarios = res.get("scenarios", [])
             
-            for item in instructions:
-                lang = item.get("language", "").upper()
-                if lang == "CN":
-                    prompt_cn = item.get("caption", "")
-                elif lang == "EN":
-                    prompt_en = item.get("caption", "")
+            prompts_cn = []
+            prompts_en = []
             
-            if not prompt_cn and not prompt_en:
+            for item in scenarios:
+                prompts_cn.append(item.get("CN", ""))
+                prompts_en.append(item.get("EN", ""))
+            
+            if not prompts_cn and not prompts_en:
                 # Fallback if structure is unexpected
-                prompt_en = raw
-                prompt_cn = raw
+                prompts_en = [raw]
+                prompts_cn = [raw]
 
         except Exception as e:
             # Fallback
-            prompt_en = raw
-            prompt_cn = raw
+            prompts_en = [raw]
+            prompts_cn = [raw]
             
         dt = time.time() - t0
-        return base, (prompt_en, prompt_cn), True, dt, ""
+        return base, (prompts_en, prompts_cn), True, dt, ""
     except Exception as e:
         dt = time.time() - t0
-        return base, ("", ""), False, dt, str(e)
+        return base, ([], []), False, dt, str(e)
 
 
 def main():

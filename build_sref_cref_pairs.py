@@ -12,21 +12,51 @@ except Exception:
     tqdm = None
 from megfile.smart import smart_listdir, smart_exists, smart_makedirs, smart_open as mopen
 """
-python /data/LoraPipeline/utils/build_sref_cref_pairs.py \
-  --content-dir /mnt/jfs/bench-bucket/sref_bench/bench_1106_content_prompt \
+python /data/benchmark_metrics/build_sref_cref_pairs.py \
+  --content-dir /mnt/jfs/bench-bucket/sref_bench/bench_1106_content_prompt_new/ \
   --style-dir /mnt/jfs/bench-bucket/sref_bench/bench_0222_style/bench_1022_style/ \
-  --out-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_new  \
+  --out-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture  \
   --num-combos 800 \
   --max-side 2048 \
+  --use-style-prompt\
   --seed 288
-python /data/LoraPipeline/utils/build_sref_cref_pairs.py \
-  --content-dir /mnt/jfs/bench-bucket/sref_bench/bench_1106_content_prompt \
+python /data/benchmark_metrics/build_sref_cref_pairs.py \
+  --content-dir /mnt/jfs/bench-bucket/sref_bench/bench_1106_content_prompt_new \
   --style-dir /mnt/jfs/bench-bucket/sref_bench/bench_0222_style/bench_1022_style/ \
-  --out-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_sref\
+  --out-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_sref_ture \
   --num-combos 800 \
   --seed 200 \
   --max-side 2048 
 """
+style_list=[
+  "Please apply the style of the reference image.",
+  "Reference style: apply to the target image.",
+  "Apply the style from the reference image.",
+  "Synthesize the image using the reference style.",
+  "Apply the style from the reference.",
+  "Create an image in the style of the reference.",
+  "Adopt the style attribute of the style reference, such as color palette and brushwork.",
+  "Use the provided style reference image as a style guide.",
+  "Apply the aesthetic of the style reference image.",
+  "Style reference: mimic the input style.",
+  "Use the style of the reference image.",
+  "Use the reference image's mood and style.",
+  "Render the image in the style of the reference.",
+  "Follow the artistic style direction of the reference image.",
+  "Make it look like the reference style.",
+  "Transform the image to match the style of the reference.",
+  "Apply the reference style.",
+  "Use the reference image's style for generation.",
+  "Apply the reference image's artistic flair.",
+  "Recreate the image with the style of the provided reference.",
+  "Transfer the artistic style of the reference to this image.",
+  "Transfer style from the reference.",
+  "Match the style of the reference image.",
+  "Use the reference image to define the visual style.",
+  "Generate the image using the style from the reference.",
+  "Make the output follow the style of the reference.",
+  "Style transfer: use the reference image's style."
+]
 
 def norm_dir(p: str) -> str:
     return p if p.endswith("/") else (p + "/")
@@ -65,7 +95,14 @@ def read_edit_prompts(img_path: str) -> Optional[List[str]]:
             obj = json.load(f)
     except Exception:
         return None
-    prompts = obj.get("edit_prompts")
+        
+    # Updated logic: Look for 'caption_en' which is a list of strings
+    prompts = obj.get("caption_en")
+    
+    # Fallback to old key 'edit_prompts' if 'caption_en' is missing
+    if not prompts:
+        prompts = obj.get("edit_prompts")
+
     cleaned: List[str] = []
     if isinstance(prompts, list):
         cleaned = [p for p in prompts if isinstance(p, str) and p.strip()]
@@ -119,6 +156,7 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--exts", default=".png,.jpg,.jpeg,.webp,.bmp,.avif")
     ap.add_argument("--max-side", type=int, default=2048)
+    ap.add_argument("--use-style-prompt", action="store_true", help="If set, append a random style prompt to the content prompt.")
     args = ap.parse_args()
 
     exts = [x.strip().lower() for x in args.exts.split(",") if x.strip()]
@@ -166,7 +204,20 @@ def main():
     def write_pair(style_path: str):
         nonlocal total
         content_path, prompts = next_content()
-        prompt = rng.choice(prompts)
+        
+        # Randomly select a prompt from the content's available prompts
+        base_prompt = rng.choice(prompts)
+        
+        # If use_style_prompt is enabled, append a random style instruction
+        if args.use_style_prompt:
+            style_instruction = rng.choice(style_list)
+            # Ensure proper spacing/punctuation
+            if not base_prompt.strip().endswith(('.', '!', '?')):
+                base_prompt = base_prompt.strip() + "."
+            prompt = f"{base_prompt} {style_instruction}"
+        else:
+            prompt = style_list[total % len(style_list)] if len(style_list) > 0 else "Apply style."
+
         basename = f"{total:06d}"
         cref_out = join_path(cref_dir, basename + ".png")
         sref_out = join_path(sref_dir, basename + ".png")

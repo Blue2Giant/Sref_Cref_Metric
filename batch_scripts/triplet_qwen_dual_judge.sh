@@ -6,7 +6,7 @@ while true;do
     result_dir="/mnt/jfs/bench-bucket/sref_bench/sample_1500_bench_cref_sref/qwen_output_resize"
     output_json_content="s3://lanjinghong-data/sample_1500_bench_cref_sref/qwen_resize_output_content.json"
     output_json_style="s3://lanjinghong-data/sample_1500_bench_cref_sref/qwen_resize_output_style.json" 
-    python3 /data/benchmark_metrics/triplet_similarity/triplet_qwen_dual_judge.py \
+    python3 /data/benchmark_metrics/vlm_similarity/triplet_qwen_dual_judge.py \
         --content_dir "$content_dir" \
         --style_dir "$style_dir" \
         --result_dir "$result_dir" \

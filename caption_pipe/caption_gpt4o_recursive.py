@@ -5,7 +5,10 @@ Recursively scan a directory for images, generate 10 diverse prompts (bilingual)
 and save them to a JSON file with the same basename as the image.
 
 Usage:
-python3 /data/benchmark_metrics/caption_gpt4o_recursive.py --root /mnt/jfs/bench-bucket/sref_bench/bench_1106_content_prompt_new/ --workers 16 
+python3 /data/benchmark_metrics/caption_gpt4o_recursive.py \
+    --root /mnt/jfs/bench-bucket/sref_bench/bench_1106_content_prompt_new/ --workers 16 
+python3 /data/benchmark_metrics/caption_pipe/caption_gpt4o_recursive.py \
+    --root /mnt/jfs/bench-bucket/sref_bench/bench_0228_content_prompt/  --workers 16 --overwrite
 """
 
 import argparse
@@ -44,6 +47,8 @@ Important rules:
 - The synthesis must not look like pasted or cut-out elements. The result must appear as a newly rendered, seamless picture.
 - The subject from the reference image must interact naturally with the new environment or objects.
 - The final image must associate with the reference image but offer a fresh perspective or story.
+- **Ignore style**: Just consider the content in the picture. If there is a style, don't take it into account.
+- **Avoid overly exaggerated imagination**: The captions written should be as reasonable as possible and depict scenarios that could exist in daily life.
 
 Output format:
 Return only valid JSON, no extra explanation. The JSON must have this structure:

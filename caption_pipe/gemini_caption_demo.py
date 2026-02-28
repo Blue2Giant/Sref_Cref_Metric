@@ -75,7 +75,7 @@ def main():
             "api_version": "v1alpha",
             "base_url": "https://models-proxy.stepfun-inc.com/gemini",
         },
-        api_key=os.getenv("GEMINI_API_KEY", "ak-dhco9tfkhr9sb5n2zkgoy0alyeodm3ig"),
+        api_key=os.getenv("GEMINI_API_KEY", ""),
     )
 
     img_bytes = image_to_bytes(image_path)

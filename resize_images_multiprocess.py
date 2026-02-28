@@ -1,49 +1,72 @@
 import os
 import argparse
+import shutil
 from multiprocessing import Pool, cpu_count
+from typing import List, Tuple
 from PIL import Image
 from tqdm import tqdm
 """
 python /data/benchmark_metrics/resize_images_multiprocess.py --input_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_new/cref \
-    --output_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_new_resized_cref --size 512 --num_workers 16
+    --output_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_new_resized_cref --num_workers 16
 python /data/benchmark_metrics/resize_images_multiprocess.py --input_dir /mnt/jfs/bench-bucket/sref_bench/bench_1106_content_prompt_new \
-    --output_dir /mnt/jfs/bench-bucket/sref_bench/bench_1106_content_prompt_resized_512_new --size 512 --num_workers 16
+    --output_dir /mnt/jfs/bench-bucket/sref_bench/bench_1106_content_prompt_resized_512_new --num_workers 16 --copy_json
+
+python /data/benchmark_metrics/resize_images_multiprocess.py --input_dir /mnt/jfs/bench-bucket/sref_bench/bench_0228_content_prompt/ \
+    --output_dir /mnt/jfs/bench-bucket/sref_bench/bench_0228_content_prompt_resize --num_workers 16 --copy_json
+python /data/benchmark_metrics/resize_images_multiprocess.py --input_dir /mnt/jfs/bench-bucket/sref_bench/bench_0222_style/bench_1022_style/ \
+    --output_dir /mnt/jfs/bench-bucket/sref_bench/bench_0222_style/bench_1022_style_resize --num_workers 16 --copy_json
 """
+
+PREFERRED_KONTEXT_RESOLUTIONS: List[Tuple[int, int]] = [
+    (672, 1568),
+    (688, 1504),
+    (720, 1456),
+    (752, 1392),
+    (800, 1328),
+    (832, 1248),
+    (880, 1184),
+    (944, 1104),
+    (1024, 1024),
+    (1104, 944),
+    (1184, 880),
+    (1248, 832),
+    (1328, 800),
+    (1392, 752),
+    (1456, 720),
+    (1504, 688),
+    (1568, 672),
+]
+
+def _lanczos():
+    return getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+
+def resize_like_qwen(img: Image.Image) -> Image.Image:
+    w, h = img.size
+    aspect_ratio = w / float(h)
+    _, target_w, target_h = min(
+        (abs(aspect_ratio - (rw / float(rh))), rw, rh)
+        for (rw, rh) in PREFERRED_KONTEXT_RESOLUTIONS
+    )
+    if (w, h) == (target_w, target_h):
+        return img
+    return img.resize((target_w, target_h), resample=_lanczos())
 def resize_image_task(args):
-    """
-    Worker function to resize a single image.
-    args: (file_path, output_dir, target_size)
-    """
-    file_path, output_dir, target_size = args
+    file_path, output_dir, copy_json = args
     try:
         filename = os.path.basename(file_path)
-        output_path = os.path.join(output_dir, filename)
-        ext = os.path.splitext(filename)[1].lower()
-        
-        with Image.open(file_path) as img:
-            width, height = img.size
-            max_dim = max(width, height)
-            
-            # Calculate new size
-            if max_dim != target_size:
-                ratio = target_size / max_dim
-                new_width = int(width * ratio)
-                new_height = int(height * ratio)
-                # Use high-quality resampling
-                img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            else:
-                img_resized = img.copy()
+        base = os.path.splitext(filename)[0]
+        output_path = os.path.join(output_dir, base + ".png")
 
-            # Handle mode conversion for JPEG
-            if ext in ['.jpg', '.jpeg'] and img_resized.mode in ('RGBA', 'P'):
-                img_resized = img_resized.convert('RGB')
-            
-            # Save
-            # quality=95 for JPEGs to maintain high quality
-            if ext in ['.jpg', '.jpeg']:
-                img_resized.save(output_path, quality=95)
-            else:
-                img_resized.save(output_path)
+        with Image.open(file_path) as img:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img_resized = resize_like_qwen(img)
+            img_resized.save(output_path, format="PNG")
+
+        if copy_json:
+            json_path = os.path.splitext(file_path)[0] + ".json"
+            if os.path.exists(json_path):
+                shutil.copy2(json_path, os.path.join(output_dir, base + ".json"))
                      
         return True
     except Exception as e:
@@ -51,11 +74,11 @@ def resize_image_task(args):
         return False
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch resize images to a specific long side length using multiprocessing.")
+    parser = argparse.ArgumentParser(description="Batch resize images using preferred aspect ratios and save as PNG.")
     parser.add_argument("--input_dir", type=str, required=True, help="Path to the input directory containing images.")
     parser.add_argument("--output_dir", type=str, required=True, help="Path to the output directory.")
-    parser.add_argument("--size", type=int, default=512, help="Target length for the long side (default: 512).")
     parser.add_argument("--num_workers", type=int, default=cpu_count(), help="Number of worker processes (default: CPU count).")
+    parser.add_argument("--copy_json", action="store_true", help="Copy same-basename .json files if present.")
     
     args = parser.parse_args()
     
@@ -67,12 +90,16 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
         print(f"Created output directory: {args.output_dir}")
 
-    # Supported extensions
-    valid_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'}
-    
-    # Collect image files (top-level only)
     files = [f for f in os.listdir(args.input_dir) if os.path.isfile(os.path.join(args.input_dir, f))]
-    image_files = [os.path.join(args.input_dir, f) for f in files if os.path.splitext(f)[1].lower() in valid_exts]
+    image_files = []
+    for f in files:
+        path = os.path.join(args.input_dir, f)
+        try:
+            with Image.open(path) as img:
+                img.verify()
+            image_files.append(path)
+        except Exception:
+            continue
     
     if not image_files:
         print("No image files found in the input directory.")
@@ -81,10 +108,10 @@ def main():
     # Sort files to ensure deterministic order (though processing is parallel)
     image_files.sort()
 
-    print(f"Found {len(image_files)} images. Starting resize to long side {args.size} with {args.num_workers} workers...")
+    print(f"Found {len(image_files)} images. Starting resize with {args.num_workers} workers...")
     
     # Prepare arguments for workers
-    tasks = [(f, args.output_dir, args.size) for f in image_files]
+    tasks = [(f, args.output_dir, args.copy_json) for f in image_files]
     
     # Run with pool
     with Pool(processes=args.num_workers) as pool:

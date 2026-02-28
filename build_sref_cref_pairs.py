@@ -184,30 +184,58 @@ def main():
 
     rng = random.Random(args.seed)
     rng.shuffle(style_paths)
-    rng.shuffle(content_items)
-
-    prompts_map: Dict[str, str] = {}
-    content_pool: List[Tuple[str, List[str]]] = []
+    
+    # Initialize tracking for unused prompts
+     # Map: content_path -> shuffled list of available prompts
+    unused_prompts_map: Dict[str, List[str]] = {}
+    for p, prompts in content_items:
+        # Create a copy and shuffle it so the order of usage is random
+        p_list = list(prompts)
+        rng.shuffle(p_list)
+        unused_prompts_map[p] = p_list
+ 
+    # prompts_map: Dict[str, str] = {} # No longer needed for final dump
+    content_pool: List[str] = []
 
     def refill_pool():
         content_pool.clear()
-        content_pool.extend(content_items)
+        # Only include paths that still have unused prompts
+        valid_paths = [p for p in unused_prompts_map if unused_prompts_map[p]]
+        if not valid_paths:
+            raise RuntimeError("Run out of unique prompts for all content images!")
+        content_pool.extend(valid_paths)
         rng.shuffle(content_pool)
-
-    def next_content() -> Tuple[str, List[str]]:
+ 
+    def next_content_pair() -> Tuple[str, str]:
         if not content_pool:
             refill_pool()
-        return content_pool.pop()
+        
+        # Get a path from the pool
+        path = content_pool.pop()
+        
+        # Get the next unused prompt for this path
+        prompts_list = unused_prompts_map[path]
+        if not prompts_list:
+            # This path is exhausted, try next one in pool
+            return next_content_pair()
+            
+        prompt = prompts_list.pop()
+        return path, prompt
 
     total = 0
+    
+    prompts_path = join_path(out_dir, "prompts.json")
+    prompts_file = mopen(prompts_path, "w", encoding="utf-8")
+    prompts_file.write("{\n")
+    is_first_prompt = True
 
-    def write_pair(style_path: str):
-        nonlocal total
-        content_path, prompts = next_content()
-        
-        # Randomly select a prompt from the content's available prompts
-        base_prompt = rng.choice(prompts)
-        
+    def write_pair(style_path: str) -> bool:
+        nonlocal total, is_first_prompt
+        try:
+            content_path, base_prompt = next_content_pair()
+        except RuntimeError:
+            return False
+
         # If use_style_prompt is enabled, append a random style instruction
         if args.use_style_prompt:
             style_instruction = rng.choice(style_list)
@@ -218,22 +246,40 @@ def main():
         else:
             prompt = style_list[total % len(style_list)] if len(style_list) > 0 else "Apply style."
 
-        basename = f"{total:06d}"
+        # basename = f"{total:06d}"
+        c_name = os.path.splitext(os.path.basename(content_path))[0]
+        s_name = os.path.splitext(os.path.basename(style_path))[0]
+        basename = f"{c_name}__{s_name}"
+        
         cref_out = join_path(cref_dir, basename + ".png")
         sref_out = join_path(sref_dir, basename + ".png")
         ok_c = save_png(content_path, cref_out, args.max_side)
         ok_s = save_png(style_path, sref_out, args.max_side)
         if ok_c and ok_s:
-            prompts_map[basename] = prompt
+            # Write prompt incrementally
+            if not is_first_prompt:
+                prompts_file.write(",\n")
+            else:
+                is_first_prompt = False
+            
+            line = f'  "{basename}": {json.dumps(prompt, ensure_ascii=False)}'
+            prompts_file.write(line)
+            prompts_file.flush()
+            
             total += 1
+        return True
 
     bar = tqdm(total=args.num_combos, unit="pair") if tqdm else None
-    while total < args.num_combos:
+    stop_early = False
+    while total < args.num_combos and not stop_early:
         for sp in style_paths:
             if total >= args.num_combos:
                 break
             before = total
-            write_pair(sp)
+            if not write_pair(sp):
+                print(f"[WARNING] Stopping early at {total} pairs due to lack of unique prompts.")
+                stop_early = True
+                break
             if bar and total > before:
                 bar.update(total - before)
             elif (not bar) and total % 100 == 0 and total > 0:
@@ -241,9 +287,9 @@ def main():
 
     if bar:
         bar.close()
-    prompts_path = join_path(out_dir, "prompts.json")
-    with mopen(prompts_path, "w", encoding="utf-8") as f:
-        json.dump(prompts_map, f, ensure_ascii=False, indent=2)
+    
+    prompts_file.write("\n}")
+    prompts_file.close()
 
     print(f"[DONE] total={total} -> {out_dir}")
 

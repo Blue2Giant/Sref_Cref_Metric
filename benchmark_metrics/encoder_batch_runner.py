@@ -7,7 +7,6 @@ import os
 import re
 import multiprocessing as mp
 from typing import Dict, Any, List, Tuple
-from transformers.cache_utils import Cache
 import torch
 from PIL import Image
 from tqdm import tqdm
@@ -198,6 +197,63 @@ def build_tasks_onealign(image_dir: str) -> List[Tuple[str, str]]:
     return [(k, image_map[k]) for k in keys]
 
 
+def build_tasks_aesthetic(image_dir: str) -> List[Tuple[str, str]]:
+    image_map = list_images(image_dir)
+    keys = list(image_map.keys())
+    return [(k, image_map[k]) for k in keys]
+
+
+def _laion_head_dim(clip_model: str) -> int:
+    name = clip_model.lower().replace("_", "-")
+    if name in ["vit-l-14", "vit-l-14-336"]:
+        return 768
+    if name in ["vit-b-32", "vit-b-16"]:
+        return 512
+    raise ValueError(f"Unsupported clip_model for laion: {clip_model}")
+
+
+def load_laion_aesthetic(clip_model: str, clip_ckpt: str, pretrained_tag: str, linear_path: str, device: str):
+    import torch.nn as nn
+    from urllib.request import urlretrieve
+    import open_clip
+
+    linear_path = os.path.expanduser(linear_path)
+    if not os.path.isfile(linear_path):
+        os.makedirs(os.path.dirname(linear_path), exist_ok=True)
+        url_key = clip_model.lower().replace("-", "_")
+        url_model = (
+            "https://github.com/LAION-AI/aesthetic-predictor/blob/main/sa_0_4_"
+            + url_key
+            + "_linear.pth?raw=true"
+        )
+        urlretrieve(url_model, linear_path)
+    head_dim = _laion_head_dim(clip_model)
+    linear = nn.Linear(head_dim, 1)
+    state = torch.load(linear_path, map_location="cpu")
+    linear.load_state_dict(state)
+    linear.eval().to(device)
+    pretrained = clip_ckpt if clip_ckpt and os.path.isfile(clip_ckpt) else pretrained_tag
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        clip_model,
+        pretrained=pretrained,
+        device=device,
+    )
+    model.eval()
+    return model, preprocess, linear
+
+
+def load_aesthetic_v25(encoder_model_name: str, device: str, dtype):
+    from aesthetic_predictor_v2_5 import convert_v2_5_from_siglip
+
+    model, preprocessor = convert_v2_5_from_siglip(
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+        encoder_model_name=encoder_model_name,
+    )
+    model = model.to(dtype).to(device)
+    return model, preprocessor
+
+
 def _setup_cuda_env(args_dict: dict):
     cuda_visible = args_dict.get("cuda_visible_devices")
     if cuda_visible is not None:
@@ -280,6 +336,46 @@ def worker_onealign(args_dict: dict, tasks: List[Tuple[str, str]], out_queue: mp
         if hasattr(score, "item"):
             score = score.item()
         out_queue.put((k, float(score)))
+
+
+def worker_aesthetic(args_dict: dict, tasks: List[Tuple[str, str]], out_queue: mp.Queue):
+    _setup_cuda_env(args_dict)
+    device = args_dict["device"]
+    backend = args_dict["backend"]
+    if backend == "laion":
+        model, preprocess, linear = load_laion_aesthetic(
+            args_dict["laion_clip_model"],
+            args_dict["laion_clip_ckpt"],
+            args_dict["laion_pretrained_tag"],
+            args_dict["laion_linear_path"],
+            device,
+        )
+        for k, img_path in tasks:
+            img = read_image(img_path)
+            x = preprocess(img).unsqueeze(0).to(device)
+            feats = model.encode_image(x)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            score = linear(feats).squeeze()
+            if hasattr(score, "item"):
+                score = score.item()
+            out_queue.put((k, float(score)))
+        return
+    if backend == "v25":
+        dtype = args_dict["dtype"]
+        model, preprocessor = load_aesthetic_v25(
+            args_dict["v25_encoder_model_name"],
+            device,
+            dtype,
+        )
+        for k, img_path in tasks:
+            img = read_image(img_path)
+            pixel_values = preprocessor(images=img, return_tensors="pt").pixel_values.to(dtype).to(device)
+            score = model(pixel_values).logits.squeeze()
+            if hasattr(score, "item"):
+                score = score.item()
+            out_queue.put((k, float(score)))
+        return
+    raise ValueError(f"Unsupported aesthetic backend: {backend}")
 
 
 def parse_gpus(gpu_str: str) -> List[int]:
@@ -376,6 +472,21 @@ def main():
     ap_one.add_argument("--gpus", default="")
     ap_one.add_argument("--overwrite", action="store_true")
 
+    ap_aes = sub.add_parser("aesthetic")
+    ap_aes.add_argument("--backend", choices=["laion", "v25"], required=True)
+    ap_aes.add_argument("--image_dir", required=True)
+    ap_aes.add_argument("--out_json", required=True)
+    ap_aes.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap_aes.add_argument("--num_procs", type=int, default=4)
+    ap_aes.add_argument("--gpus", default="")
+    ap_aes.add_argument("--overwrite", action="store_true")
+    ap_aes.add_argument("--laion_clip_model", default="ViT-L-14")
+    ap_aes.add_argument("--laion_clip_ckpt", default="/mnt/jfs/model_zoo/open_clip/open_clip_model_ea4f182e96863ce2a27be5067cdb54d4.safetensors")
+    ap_aes.add_argument("--laion_pretrained_tag", default="openai")
+    ap_aes.add_argument("--laion_linear_path", default="~/.cache/emb_reader/sa_0_4_vit_l_14_linear.pth")
+    ap_aes.add_argument("--v25_encoder_model_name", default="/mnt/jfs/model_zoo/siglip-so400m-patch14-384/")
+    ap_aes.add_argument("--dtype", default="bfloat16")
+
     args = ap.parse_args()
 
     if args.mode == "pair":
@@ -419,6 +530,24 @@ def main():
             "gpus": args.gpus,
         }
         run_batch(tasks, args.out_json, args.overwrite, worker_onealign, args_dict)
+        return
+
+    if args.mode == "aesthetic":
+        dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
+        tasks = build_tasks_aesthetic(args.image_dir)
+        args_dict = {
+            "backend": args.backend,
+            "device": args.device,
+            "num_procs": args.num_procs,
+            "gpus": args.gpus,
+            "laion_clip_model": args.laion_clip_model,
+            "laion_clip_ckpt": args.laion_clip_ckpt,
+            "laion_pretrained_tag": args.laion_pretrained_tag,
+            "laion_linear_path": args.laion_linear_path,
+            "v25_encoder_model_name": args.v25_encoder_model_name,
+            "dtype": dtype,
+        }
+        run_batch(tasks, args.out_json, args.overwrite, worker_aesthetic, args_dict)
         return
 
 

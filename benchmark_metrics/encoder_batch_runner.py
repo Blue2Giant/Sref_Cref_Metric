@@ -457,7 +457,7 @@ def main():
     ap_pair.add_argument("--dtype", default="bfloat16")
     ap_pair.add_argument("--num_procs", type=int, default=4)
     ap_pair.add_argument("--gpus", default="")
-    ap_pair.add_argument("--overwrite", action="store_true")
+    ap_pair.add_argument("--overwrite", type=bool, default=0)
     ap_pair.add_argument("--csd_arch", default="vit_base")
     ap_pair.add_argument("--csd_model_path", default="")
 
@@ -479,8 +479,7 @@ def main():
     ap_one.add_argument("--dtype", default="float16")
     ap_one.add_argument("--num_procs", type=int, default=4)
     ap_one.add_argument("--gpus", default="")
-    ap_one.add_argument("--overwrite", action="store_true")
-
+    ap_one.add_argument("--overwrite", type=bool, default=0)
     ap_aes = sub.add_parser("aesthetic")
     ap_aes.add_argument("--backend", choices=["laion", "v25"], required=True)
     ap_aes.add_argument("--image_dir", required=True)
@@ -488,7 +487,6 @@ def main():
     ap_aes.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap_aes.add_argument("--num_procs", type=int, default=4)
     ap_aes.add_argument("--gpus", default="")
-    ap_aes.add_argument("--overwrite", action="store_true")
     ap_aes.add_argument("--laion_clip_model", default="ViT-L-14")
     ap_aes.add_argument("--laion_clip_ckpt", default="/mnt/jfs/model_zoo/open_clip/open_clip_model_ea4f182e96863ce2a27be5067cdb54d4.safetensors")
     ap_aes.add_argument("--laion_pretrained_tag", default="openai")

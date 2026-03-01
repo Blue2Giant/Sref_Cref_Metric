@@ -27,44 +27,50 @@ OUT_ONEALIGN_JSON="$SREF_ROOT/onealign_out.json"
 OUT_CSD_JSON="$SREF_ROOT/csd_out.json"
 OUT_LAION_JSON="$SREF_ROOT/laion_scores.json"
 OUT_V25_AESTHETIC="$SREF_ROOT/v25_scores.json"
+overwrite=1
 #风格一致性
-echo "==== CSD ===="
-python3 "$RUNNER_PY" pair \
-  --encoder csd \
-  --dir_a "$STYLE_DIR" \
-  --dir_b "$RESULT_DIR" \
-  --out_json "$OUT_CSD_JSON" \
-  --model dummy \
-  --csd_arch vit_base \
-  --csd_model_path $CSD_MODEL \
-  --device cuda \
-  --gpus "$GPUS"
-echo "=== oneig ===="
-python3 "$RUNNER_PY" pair \
-  --encoder oneig \
-  --dir_a "$STYLE_DIR" \
-  --dir_b "$RESULT_DIR" \
-  --model "$ONEIG_MODEL" \
-  --out_json "$OUT_ONEIG_JSON" \
-  --gpus "$GPUS"
+# echo "==== CSD ===="
+# python3 "$RUNNER_PY" pair \
+#   --encoder csd \
+#   --dir_a "$STYLE_DIR" \
+#   --dir_b "$RESULT_DIR" \
+#   --out_json "$OUT_CSD_JSON" \
+#   --model dummy \
+#   --csd_arch vit_base \
+#   --csd_model_path $CSD_MODEL \
+#   --device cuda \
+#   --gpus "$GPUS" \
+#   --overwrite $overwrite
 
-#内容一致性
-echo "=== dinov2 ===="
-python3 "$RUNNER_PY" pair \
-  --encoder dinov2 \
-  --dir_a "$CONTENT_DIR" \
-  --dir_b "$RESULT_DIR" \
-  --model "$DINOV2_MODEL" \
-  --out_json "$OUT_DINOV2_JSON" \
-  --gpus "$GPUS"
-echo "=== cas ===="
-python3 "$RUNNER_PY" pair \
-  --encoder cas \
-  --dir_a "$CONTENT_DIR" \
-  --dir_b "$RESULT_DIR" \
-  --model "$CAS_MODEL" \
-  --out_json "$OUT_CAS_JSON" \
-  --gpus "$GPUS"
+# echo "=== oneig ===="
+# python3 "$RUNNER_PY" pair \
+#   --encoder oneig \
+#   --dir_a "$STYLE_DIR" \
+#   --dir_b "$RESULT_DIR" \
+#   --model "$ONEIG_MODEL" \
+#   --out_json "$OUT_ONEIG_JSON" \
+#   --gpus "$GPUS" \
+#   --overwrite $overwrite
+
+# #内容一致性
+# echo "=== dinov2 ===="
+# python3 "$RUNNER_PY" pair \
+#   --encoder dinov2 \
+#   --dir_a "$CONTENT_DIR" \
+#   --dir_b "$RESULT_DIR" \
+#   --model "$DINOV2_MODEL" \
+#   --out_json "$OUT_DINOV2_JSON" \
+#   --gpus "$GPUS" \
+#   --overwrite $overwrite
+# echo "=== cas ===="
+# python3 "$RUNNER_PY" pair \
+#   --encoder cas \
+#   --dir_a "$CONTENT_DIR" \
+#   --dir_b "$RESULT_DIR" \
+#   --model "$CAS_MODEL" \
+#   --out_json "$OUT_CAS_JSON" \
+#   --gpus "$GPUS" \
+#   --overwrite $overwrite
 
 #指令遵循
 echo "=== clip cap ==="
@@ -73,7 +79,8 @@ python3 "$RUNNER_PY" clip_cap \
   --prompt_json "$SREF_PROMPT" \
   --out_json "$OUT_CLIPCAP_JSON" \
   --model "$CLIPCAP_MODEL" \
-  --gpus "$GPUS"
+  --gpus "$GPUS" \
+  --overwrite $overwrite
 
 #美学评分
 echo "=== laion aesthetic ==="
@@ -85,7 +92,8 @@ python /data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py aesthet
   --laion_clip_ckpt /mnt/jfs/model_zoo/open_clip/open_clip_model_ea4f182e96863ce2a27be5067cdb54d4.safetensors \
   --laion_linear_path ~/.cache/emb_reader/sa_0_4_vit_l_14_linear.pth \
   --device cuda \
-  --gpus 0
+  --gpus 0 \
+  --overwrite $overwrite
 
 echo "==== aesthetic v25 ===="
 python /data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py aesthetic \
@@ -95,4 +103,5 @@ python /data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py aesthet
   --v25_encoder_model_name /mnt/jfs/model_zoo/siglip-so400m-patch14-384/ \
   --dtype bfloat16 \
   --device cuda \
-  --gpus 0
+  --gpus 0 \
+  --overwrite $overwrite

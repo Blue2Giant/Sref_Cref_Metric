@@ -8,3 +8,13 @@
 - OneAlign ：模型输出分数， 无强制边界 （取决于模型实现）。
 - LAION aesthetic ：线性头输出， 无强制边界 （通常在 0–10 左右）。
 - Aesthetic v2.5 ：logits 输出， 无强制边界 （通常在 0–10 左右）。
+
+image encoder score:
+/data/benchmark_metrics/batch_scripts/encoder_batch.sh
+
+triplet score:
+/data/benchmark_metrics/batch_scripts/triplet_qwen_dual_judge.sh
+
+discrete vlm score:
+/data/benchmark_metrics/batch_scripts/style_similarity_batch.sh
+/data/benchmark_metrics/batch_scripts/content_similarity_batch.sh

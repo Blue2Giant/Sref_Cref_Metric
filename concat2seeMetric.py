@@ -17,8 +17,8 @@ python /data/benchmark_metrics/concat2seeMetric.py \
 
 其他：
 python /data/benchmark_metrics/concat2seeMetric.py \
-  --folders /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/sref /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen-edit \
-  --jsons /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/clipcap_out.json /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/onealign_out.json /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/laion_scores.json /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/v25_scores.json \
+  --folders  /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen-edit \
+  --jsons /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/clipcap_out.json  /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/laion_scores.json /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/v25_scores.json \
   --out_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/vis_other \
   --long_side 512
 """

@@ -87,7 +87,7 @@ def main():
     text_part = types.Part.from_text(text=SYSTEM_PROMPT + "\n" + USER_INSTRUCTION)
 
     resp = client.models.generate_content(
-        model="gemini-3-pro-preview",
+        model="gemini-3-pro-native",
         contents=[image_part, text_part],
         config=types.GenerateContentConfig(
             max_output_tokens=4096,

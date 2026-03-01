@@ -7,12 +7,16 @@ import os
 import re
 import multiprocessing as mp
 from typing import Dict, Any, List, Tuple
-
+from transformers.cache_utils import Cache
 import torch
 from PIL import Image
+from tqdm import tqdm
 from transformers import AutoImageProcessor, AutoModel, AutoConfig
 from transformers import CLIPProcessor, CLIPModel, CLIPImageProcessor, CLIPVisionModelWithProjection
 from transformers import AutoModelForCausalLM
+from CSD.model import CSD_CLIP
+from CSD.utils import has_batchnorms, convert_state_dict
+from CSD.loss_utils import transforms_branch0
 
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -44,9 +48,8 @@ def list_images(folder: str) -> Dict[str, str]:
 
 
 def save_json(path: str, data: Dict[str, Any]) -> None:
-    ordered = dict(sorted(data.items(), key=lambda x: sort_key(x[0])))
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(ordered, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def load_json(path: str) -> Dict[str, Any]:
@@ -123,6 +126,43 @@ def oneig_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, d
     return float((embeds_a * embeds_b).sum(dim=-1).item())
 
 
+def build_csd_model(arch: str, model_path: str, device: str):
+    content_proj_head = "default"
+    model = CSD_CLIP(arch, content_proj_head)
+    if has_batchnorms(model):
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    ckpt = torch.load(model_path, map_location="cpu")
+    state_dict = convert_state_dict(ckpt["state_dict"])
+    model.load_state_dict(state_dict, strict=False)
+    model.eval().to(device)
+    preprocess = transforms_branch0
+    return model, preprocess
+
+
+@torch.no_grad()
+def csd_similarity(img_a: Image.Image, img_b: Image.Image, preprocess, model, device: str) -> float:
+    x_a = preprocess(img_a).unsqueeze(0).to(device)
+    x_b = preprocess(img_b).unsqueeze(0).to(device)
+    if hasattr(model, "encode_image"):
+        fa = model.encode_image(x_a)
+        fb = model.encode_image(x_b)
+    elif hasattr(model, "forward_image"):
+        fa = model.forward_image(x_a)
+        fb = model.forward_image(x_b)
+    else:
+        fa = model(x_a)
+        fb = model(x_b)
+    fa = fa[-1].clone() if isinstance(fa, (list, tuple)) else fa
+    fb = fb[-1].clone() if isinstance(fb, (list, tuple)) else fb
+    if fa.ndim > 2:
+        fa = fa.flatten(1)
+    if fb.ndim > 2:
+        fb = fb.flatten(1)
+    fa = torch.nn.functional.normalize(fa, dim=1)
+    fb = torch.nn.functional.normalize(fb, dim=1)
+    return float((fa * fb).sum(dim=-1).item())
+
+
 @torch.no_grad()
 def clip_image_text_similarity(image: Image.Image, caption: str, processor: CLIPProcessor, model: CLIPModel, device: str) -> float:
     inputs = processor(text=[caption], images=image, return_tensors="pt", padding=True)
@@ -138,7 +178,7 @@ def clip_image_text_similarity(image: Image.Image, caption: str, processor: CLIP
 def build_tasks_pair(dir_a: str, dir_b: str) -> List[Tuple[str, str, str]]:
     map_a = list_images(dir_a)
     map_b = list_images(dir_b)
-    keys = sorted(set(map_a.keys()) & set(map_b.keys()), key=sort_key)
+    keys = list(set(map_a.keys()) & set(map_b.keys()))
     return [(k, map_a[k], map_b[k]) for k in keys]
 
 
@@ -148,17 +188,24 @@ def build_tasks_clipcap(image_dir: str, prompt_json: str) -> List[Tuple[str, str
     if not isinstance(prompt_map, dict):
         raise ValueError("prompt_json must be a dict")
     image_map = list_images(image_dir)
-    keys = sorted(set(image_map.keys()) & set(prompt_map.keys()), key=sort_key)
+    keys = list(set(image_map.keys()) & set(prompt_map.keys()))
     return [(k, image_map[k], str(prompt_map[k])) for k in keys]
 
 
 def build_tasks_onealign(image_dir: str) -> List[Tuple[str, str]]:
     image_map = list_images(image_dir)
-    keys = sorted(image_map.keys(), key=sort_key)
+    keys = list(image_map.keys())
     return [(k, image_map[k]) for k in keys]
 
 
+def _setup_cuda_env(args_dict: dict):
+    cuda_visible = args_dict.get("cuda_visible_devices")
+    if cuda_visible is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = cuda_visible
+
+
 def worker_pair(encoder: str, args_dict: dict, tasks: List[Tuple[str, str, str]], out_queue: mp.Queue):
+    _setup_cuda_env(args_dict)
     device = args_dict["device"]
     if encoder == "dinov2":
         processor = AutoImageProcessor.from_pretrained(args_dict["model"])
@@ -193,10 +240,19 @@ def worker_pair(encoder: str, args_dict: dict, tasks: List[Tuple[str, str, str]]
             score = oneig_similarity(img_a, img_b, processor, model, device, args_dict["dtype"])
             out_queue.put((k, score))
         return
+    if encoder == "csd":
+        model, preprocess = build_csd_model(args_dict["arch"], args_dict["model_path"], device)
+        for k, p1, p2 in tasks:
+            img_a = read_image(p1)
+            img_b = read_image(p2)
+            score = csd_similarity(img_a, img_b, preprocess, model, device)
+            out_queue.put((k, score))
+        return
     raise ValueError(f"Unsupported encoder: {encoder}")
 
 
 def worker_clipcap(args_dict: dict, tasks: List[Tuple[str, str, str]], out_queue: mp.Queue):
+    _setup_cuda_env(args_dict)
     device = args_dict["device"]
     processor = CLIPProcessor.from_pretrained(args_dict["model"])
     model = CLIPModel.from_pretrained(args_dict["model"]).to(device)
@@ -208,6 +264,7 @@ def worker_clipcap(args_dict: dict, tasks: List[Tuple[str, str, str]], out_queue
 
 
 def worker_onealign(args_dict: dict, tasks: List[Tuple[str, str]], out_queue: mp.Queue):
+    _setup_cuda_env(args_dict)
     model = AutoModelForCausalLM.from_pretrained(
         args_dict["model"],
         trust_remote_code=True,
@@ -225,6 +282,18 @@ def worker_onealign(args_dict: dict, tasks: List[Tuple[str, str]], out_queue: mp
         out_queue.put((k, float(score)))
 
 
+def parse_gpus(gpu_str: str) -> List[int]:
+    if not gpu_str:
+        return []
+    items = []
+    for part in gpu_str.split(","):
+        part = part.strip()
+        if part == "":
+            continue
+        items.append(int(part))
+    return items
+
+
 def run_batch(tasks, out_path: str, overwrite: bool, worker_fn, args_dict):
     results = {}
     if (not overwrite) and os.path.isfile(out_path):
@@ -233,29 +302,38 @@ def run_batch(tasks, out_path: str, overwrite: bool, worker_fn, args_dict):
     if not tasks:
         save_json(out_path, results)
         return
-    num_procs = max(1, int(args_dict["num_procs"]))
+    gpus = parse_gpus(args_dict.get("gpus", ""))
+    num_procs = max(1, len(gpus)) if gpus else max(1, int(args_dict["num_procs"]))
     chunk_size = (len(tasks) + num_procs - 1) // num_procs
-    q = mp.Queue()
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
     workers = []
     for i in range(num_procs):
         sub = tasks[i * chunk_size : (i + 1) * chunk_size]
         if not sub:
             continue
-        p = mp.Process(target=worker_fn, args=(args_dict.get("encoder"), args_dict, sub, q)) if args_dict.get("encoder") else mp.Process(target=worker_fn, args=(args_dict, sub, q))
+        sub_args = dict(args_dict)
+        if gpus:
+            sub_args["cuda_visible_devices"] = str(gpus[i % len(gpus)])
+            sub_args["device"] = "cuda:0"
+        p = ctx.Process(target=worker_fn, args=(sub_args.get("encoder"), sub_args, sub, q)) if sub_args.get("encoder") else ctx.Process(target=worker_fn, args=(sub_args, sub, q))
         p.start()
         workers.append(p)
     total = len(tasks)
     done = 0
+    pbar = tqdm(total=total, unit="img")
     while done < total:
         try:
             k, score = q.get(timeout=5)
             results[k] = score
             done += 1
+            pbar.update(1)
         except Exception:
             if not any(p.is_alive() for p in workers) and q.empty():
                 break
     for p in workers:
         p.join()
+    pbar.close()
     save_json(out_path, results)
 
 
@@ -264,7 +342,7 @@ def main():
     sub = ap.add_subparsers(dest="mode", required=True)
 
     ap_pair = sub.add_parser("pair")
-    ap_pair.add_argument("--encoder", choices=["dinov2", "cas", "oneig"], required=True)
+    ap_pair.add_argument("--encoder", choices=["dinov2", "cas", "oneig", "csd"], required=True)
     ap_pair.add_argument("--dir_a", required=True)
     ap_pair.add_argument("--dir_b", required=True)
     ap_pair.add_argument("--out_json", required=True)
@@ -273,7 +351,10 @@ def main():
     ap_pair.add_argument("--size", type=int, default=518)
     ap_pair.add_argument("--dtype", default="bfloat16")
     ap_pair.add_argument("--num_procs", type=int, default=4)
+    ap_pair.add_argument("--gpus", default="")
     ap_pair.add_argument("--overwrite", action="store_true")
+    ap_pair.add_argument("--csd_arch", default="vit_base")
+    ap_pair.add_argument("--csd_model_path", default="")
 
     ap_clip = sub.add_parser("clip_cap")
     ap_clip.add_argument("--image_dir", required=True)
@@ -282,6 +363,7 @@ def main():
     ap_clip.add_argument("--model", default="/mnt/jfs/model_zoo/clip-vit-large-patch14")
     ap_clip.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap_clip.add_argument("--num_procs", type=int, default=4)
+    ap_clip.add_argument("--gpus", default="")
     ap_clip.add_argument("--overwrite", action="store_true")
 
     ap_one = sub.add_parser("onealign")
@@ -291,6 +373,7 @@ def main():
     ap_one.add_argument("--task", default="aesthetics")
     ap_one.add_argument("--dtype", default="float16")
     ap_one.add_argument("--num_procs", type=int, default=4)
+    ap_one.add_argument("--gpus", default="")
     ap_one.add_argument("--overwrite", action="store_true")
 
     args = ap.parse_args()
@@ -305,7 +388,12 @@ def main():
             "size": args.size,
             "dtype": dtype,
             "num_procs": args.num_procs,
+            "gpus": args.gpus,
+            "arch": args.csd_arch,
+            "model_path": args.csd_model_path,
         }
+        if args.encoder == "csd" and not args.csd_model_path:
+            raise SystemExit("--csd_model_path is required when encoder=csd")
         run_batch(tasks, args.out_json, args.overwrite, worker_pair, args_dict)
         return
 
@@ -315,6 +403,7 @@ def main():
             "model": args.model,
             "device": args.device,
             "num_procs": args.num_procs,
+            "gpus": args.gpus,
         }
         run_batch(tasks, args.out_json, args.overwrite, worker_clipcap, args_dict)
         return
@@ -327,6 +416,7 @@ def main():
             "task": args.task,
             "dtype": dtype,
             "num_procs": args.num_procs,
+            "gpus": args.gpus,
         }
         run_batch(tasks, args.out_json, args.overwrite, worker_onealign, args_dict)
         return

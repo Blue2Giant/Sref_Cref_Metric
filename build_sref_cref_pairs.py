@@ -15,17 +15,17 @@ from megfile.smart import smart_listdir, smart_exists, smart_makedirs, smart_ope
 /mnt/jfs/bench-bucket/sref_bench/bench_1106_content_prompt_new/
 /mnt/jfs/bench-bucket/sref_bench/bench_0228_content_prompt/
 python /data/benchmark_metrics/build_sref_cref_pairs.py \
-  --content-dir /mnt/jfs/bench-bucket/sref_bench/bench_0228_content_prompt/ \
-  --style-dir /mnt/jfs/bench-bucket/sref_bench/bench_0222_style/bench_1022_style/ \
-  --out-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_200_content  \
+  --content-dir /mnt/jfs/bench-bucket/sref_bench/bench_0228_content_prompt_resize \
+  --style-dir /mnt/jfs/bench-bucket/sref_bench/bench_0222_style/bench_1022_style_resize/ \
+  --out-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_cref_sref_200_content  \
   --num-combos 800 \
   --max-side 2048 \
   --use-style-prompt\
   --seed 288
 python /data/benchmark_metrics/build_sref_cref_pairs.py \
-  --content-dir /mnt/jfs/bench-bucket/sref_bench/bench_0228_content_prompt/ \
-  --style-dir /mnt/jfs/bench-bucket/sref_bench/bench_0222_style/bench_1022_style/ \
-  --out-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_sref_200_content  \
+  --content-dir /mnt/jfs/bench-bucket/sref_bench/bench_0228_content_prompt_resize \
+  --style-dir /mnt/jfs/bench-bucket/sref_bench/bench_0222_style/bench_1022_style_resize/ \
+  --out-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content  \
   --num-combos 800 \
   --seed 200 \
   --max-side 2048 

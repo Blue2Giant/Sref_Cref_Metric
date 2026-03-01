@@ -1,3 +1,4 @@
+
 #!/bin/bash
 set -euo pipefail
 cd /data/benchmark_metrics/benchmark_metrics
@@ -25,51 +26,10 @@ OUT_ONEIG_JSON="$SREF_ROOT/oneig_out.json"
 OUT_CLIPCAP_JSON="$SREF_ROOT/clipcap_out.json"
 OUT_ONEALIGN_JSON="$SREF_ROOT/onealign_out.json"
 OUT_CSD_JSON="$SREF_ROOT/csd_out.json"
-
-echo "==== CSD ===="
-python3 "$RUNNER_PY" pair \
-  --encoder csd \
-  --dir_a "$STYLE_DIR" \
-  --dir_b "$RESULT_DIR" \
-  --out_json "$OUT_CSD_JSON" \
-  --model dummy \
-  --csd_arch vit_base \
-  --csd_model_path $CSD_MODEL \
-  --device cuda \
-  --gpus "$GPUS"
-
-echo "=== dinov2 ===="
-python3 "$RUNNER_PY" pair \
-  --encoder dinov2 \
-  --dir_a "$CONTENT_DIR" \
-  --dir_b "$RESULT_DIR" \
-  --model "$DINOV2_MODEL" \
-  --out_json "$OUT_DINOV2_JSON" \
-  --gpus "$GPUS"
-
-echo "=== cas ===="
-python3 "$RUNNER_PY" pair \
-  --encoder cas \
-  --dir_a "$CONTENT_DIR" \
-  --dir_b "$RESULT_DIR" \
-  --model "$CAS_MODEL" \
-  --out_json "$OUT_CAS_JSON" \
-  --gpus "$GPUS"
-
-echo "=== oneig ===="
-python3 "$RUNNER_PY" pair \
-  --encoder oneig \
-  --dir_a "$STYLE_DIR" \
-  --dir_b "$RESULT_DIR" \
-  --model "$ONEIG_MODEL" \
-  --out_json "$OUT_ONEIG_JSON" \
-  --gpus "$GPUS"
-
-echo "=== clip cap ==="
-python3 "$RUNNER_PY" clip_cap \
+echo "=== onealign aesthetics ==="
+python3 "$RUNNER_PY" onealign \
   --image_dir "$RESULT_DIR" \
-  --prompt_json "$SREF_PROMPT" \
-  --out_json "$OUT_CLIPCAP_JSON" \
-  --model "$CLIPCAP_MODEL" \
+  --out_json "$OUT_ONEALIGN_JSON" \
+  --model "$ONEALIGN_MODEL" \
+  --task "$ONEALIGN_TASK" \
   --gpus "$GPUS"
-

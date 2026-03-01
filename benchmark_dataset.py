@@ -1,8 +1,14 @@
 """
 upload benchmark data
+
+现在推荐用cli处理，不要用python脚本
+三行搞定
+brew install huggingface-cli
+hf auth login
+hf upload Blue2Giant/FreeStyle_Bench /local/path subdir/in/repo --repo-type=dataset
 """
-from huggingface_hub import HfApi
-api = HfApi()
+# from huggingface_hub import HfApi
+# api = HfApi()
 # api.create_repo("Blue2Giant/FreeStyle_Bench", repo_type="dataset",
 # token="")
 # api.upload_file(
@@ -20,8 +26,8 @@ api = HfApi()
 # )
 #上传某个路径
 # api.upload_folder(
-#    folder_path="/mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_new",
-#    repo_id="Blue2Giant/FreeStyle_Benchmark_800",
-#    path_in_repo="bench/cref_sref",
+#    folder_path="/mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content",
+#    repo_id="Blue2Giant/FreeStyle_Bench",
+#    path_in_repo="bench/sref",
 #    repo_type="dataset",
 # )

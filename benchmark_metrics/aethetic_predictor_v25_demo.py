@@ -10,6 +10,7 @@ SAMPLE_IMAGE_PATH = Path("/data/benchmark_metrics/assets/content.webp")
 model, preprocessor = convert_v2_5_from_siglip(
     low_cpu_mem_usage=True,
     trust_remote_code=True,
+    encoder_model_name="/mnt/jfs/model_zoo/siglip-so400m-patch14-384/"
 )
 model = model.to(torch.bfloat16).cuda()
 

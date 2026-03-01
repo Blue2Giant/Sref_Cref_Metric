@@ -22,7 +22,7 @@ os.environ["LORA"] = "/data/USO/weights/USO/uso_flux_v1.0/dit_lora.safetensors"
 os.environ["PROJECTION_MODEL"] = "/data/USO/weights/USO/uso_flux_v1.0/projector.safetensors"
 os.environ["SIGLIP_PATH"] = "/data/USO/weights/siglip"
 os.environ["T5"] = "/data/USO/weights/t5-xxl"
-os.environ["CLIP"] = "/data/USO/weights/clip-vit-l14"
+os.environ["CLIP"] = "/mnt/jfs/model_zoo/clip-vit-large-patch14/"
 
 SUBJECT_PATH = "/data/benchmark_metrics/assets/content.webp"
 STYLE_PATH   = "/data/benchmark_metrics/assets/style.webp"

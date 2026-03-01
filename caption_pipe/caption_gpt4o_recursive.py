@@ -24,7 +24,7 @@ from PIL import Image
 
 # ==== Configuration ====
 BASE_URL = "https://models-proxy.stepfun-inc.com/v1"
-API_KEY = os.getenv("OPENAI_API_KEY", "ak-dhco9tfkhr9sb5n2zkgoy0alyeodm3ig")
+API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL = "gpt-4o"
 TIMEOUT = 360
 

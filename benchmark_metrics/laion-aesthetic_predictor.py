@@ -26,13 +26,20 @@ def get_aesthetic_model(clip_model="vit_l_14"):
     return m
 
 amodel= get_aesthetic_model(clip_model="vit_l_14")
+amodel.cuda()
 amodel.eval()
 
 import torch
 from PIL import Image
 import open_clip
-model, _, preprocess = open_clip.create_model_and_transforms('ViT-L-14', pretrained='openai')
-image = preprocess(Image.open("/data/benchmark_metrics/assets/style.webp")).unsqueeze(0)
+CKPT = "/mnt/jfs/model_zoo/open_clip/open_clip_model_ea4f182e96863ce2a27be5067cdb54d4.safetensors"
+
+model, _, preprocess = open_clip.create_model_and_transforms(
+    'ViT-L-14',
+    pretrained=CKPT,  # 本地权重路径，而不是 'openai'
+    device="cuda" if torch.cuda.is_available() else "cpu",
+)
+image = preprocess(Image.open("/data/benchmark_metrics/assets/style.webp")).unsqueeze(0).cuda()
 with torch.no_grad():
     image_features = model.encode_image(image)
     image_features /= image_features.norm(dim=-1, keepdim=True)

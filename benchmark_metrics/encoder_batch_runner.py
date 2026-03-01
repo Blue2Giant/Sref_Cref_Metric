@@ -62,6 +62,15 @@ def load_json(path: str) -> Dict[str, Any]:
         return {}
 
 
+def normalize_cosine_score(value: float) -> float:
+    v = (float(value) + 1.0) / 2.0
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
+
+
 @torch.no_grad()
 def dinov2_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, device: str, size: int) -> float:
     inputs_a = processor(
@@ -80,7 +89,7 @@ def dinov2_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, 
     vec_b = tokens_b.mean(dim=1)
     vec_a = vec_a / vec_a.norm(dim=-1, keepdim=True).clamp_min(1e-6)
     vec_b = vec_b / vec_b.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    return float((vec_a * vec_b).sum(dim=-1).item())
+    return normalize_cosine_score((vec_a * vec_b).sum(dim=-1).item())
 
 
 def cas_mean_std(feat, eps=1e-5):
@@ -122,7 +131,7 @@ def oneig_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, d
     embeds_b = model(inputs_b).image_embeds
     embeds_a = torch.nn.functional.normalize(embeds_a, p=2, dim=-1)
     embeds_b = torch.nn.functional.normalize(embeds_b, p=2, dim=-1)
-    return float((embeds_a * embeds_b).sum(dim=-1).item())
+    return normalize_cosine_score((embeds_a * embeds_b).sum(dim=-1).item())
 
 
 def build_csd_model(arch: str, model_path: str, device: str):
@@ -159,7 +168,7 @@ def csd_similarity(img_a: Image.Image, img_b: Image.Image, preprocess, model, de
         fb = fb.flatten(1)
     fa = torch.nn.functional.normalize(fa, dim=1)
     fb = torch.nn.functional.normalize(fb, dim=1)
-    return float((fa * fb).sum(dim=-1).item())
+    return normalize_cosine_score((fa * fb).sum(dim=-1).item())
 
 
 @torch.no_grad()
@@ -171,7 +180,7 @@ def clip_image_text_similarity(image: Image.Image, caption: str, processor: CLIP
     text_embeds = outputs.text_embeds
     image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True).clamp_min(1e-6)
     text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    return float((image_embeds * text_embeds).sum(dim=-1).item())
+    return normalize_cosine_score((image_embeds * text_embeds).sum(dim=-1).item())
 
 
 def build_tasks_pair(dir_a: str, dir_b: str) -> List[Tuple[str, str, str]]:

@@ -177,6 +177,20 @@ def draw_center_text(
     return img
 
 
+def normalize_metric_value(name: str, value):
+    if not isinstance(value, (int, float)):
+        return value
+    n = name.lower()
+    if "csd" in n:
+        v = (float(value) + 1.0) / 2.0
+        if v < 0.0:
+            v = 0.0
+        if v > 1.0:
+            v = 1.0
+        return v
+    return value
+
+
 def process_stem(payload):
     (
         stem,
@@ -207,7 +221,7 @@ def process_stem(payload):
             missing_json = True
             val = "N/A"
         else:
-            val = jd[stem]
+            val = normalize_metric_value(jname, jd[stem])
         lines.append(f"{jname}: {val}")
 
     if strict and (missing_folder or missing_json):

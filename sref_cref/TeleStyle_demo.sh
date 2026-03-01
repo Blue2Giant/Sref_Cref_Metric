@@ -4,12 +4,12 @@ export DIFFSYNTH_DOWNLOAD_SOURCE=huggingface
 export TELESTYLE_DIR=/mnt/jfs/model_zoo/Tele-AI/TeleStyle
 #single running
 #python /data/benchmark_metrics/sref_cref/TeleStyle_demo.py
-
+sref_root=/mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content
 #batch running
 python /data/benchmark_metrics/sref_cref/TeleStyle_batch.py \
-  --cref_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_new/cref \
-  --sref_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_new/sref \
-  --prompts_json /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_new/prompts.json \
-  --output_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_new/TeleStyle \
+  --cref_dir $sref_root/cref \
+  --sref_dir $sref_root/sref \
+  --prompts_json $sref_root/prompts.json \
+  --output_dir $sref_root/TeleStyle \
   --steps 4 \
   --minedge 1024

@@ -1,19 +1,4 @@
-import argparse
-import json
 import os
-from typing import Dict, List
-
-import torch
-from PIL import Image
-from transformers import SiglipVisionModel, SiglipImageProcessor
-
-from uso.flux.pipeline import USOPipeline, preprocess_ref
-
-try:
-    from tqdm import tqdm
-except Exception:
-    tqdm = None
-
 os.environ["FLUX_DEV"] = "/data/USO/weights/FLUX.1-dev/flux1-dev.safetensors"
 os.environ["AE"] = "/data/USO/weights/FLUX.1-dev/ae.safetensors"
 os.environ["LORA"] = "/data/USO/weights/USO/uso_flux_v1.0/dit_lora.safetensors"
@@ -21,6 +6,21 @@ os.environ["PROJECTION_MODEL"] = "/data/USO/weights/USO/uso_flux_v1.0/projector.
 os.environ["SIGLIP_PATH"] = "/data/USO/weights/siglip"
 os.environ["T5"] = "/data/USO/weights/t5-xxl"
 os.environ["CLIP"] = "/mnt/jfs/model_zoo/clip-vit-large-patch14"
+
+import argparse
+import json
+from typing import Dict, List
+
+import torch
+from PIL import Image
+from transformers import SiglipVisionModel, SiglipImageProcessor
+from tqdm import tqdm
+from uso.flux.pipeline import USOPipeline, preprocess_ref
+
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
 
 def list_images_map(dir_path: str, exts: List[str]) -> Dict[str, str]:
@@ -65,6 +65,7 @@ def parse_args():
     ap.add_argument("--save-attn", action="store_true")
     ap.add_argument("--save-attn-path", default="")
     ap.add_argument("--use-siglip", action="store_true")
+    ap.add_argument("--sref-only", action="store_true")
     return ap.parse_args()
 
 
@@ -92,7 +93,7 @@ def main():
         raise RuntimeError("没有可处理的样本")
 
     os.makedirs(args.out_dir, exist_ok=True)
-
+    print("initializing pipeline......")
     pipe = USOPipeline(
         args.model_type,
         device,
@@ -131,7 +132,10 @@ def main():
             w, h = args.width, args.height
             if args.instruct_edit and len(ref_imgs_pil) > 0:
                 w, h = ref_imgs_pil[0].size
-            prompt = str(prompts_obj[b])
+            if args.sref_only:
+                prompt = ""
+            else:
+                prompt = str(prompts_obj[b])
             img = pipe(
                 prompt=prompt,
                 width=w,

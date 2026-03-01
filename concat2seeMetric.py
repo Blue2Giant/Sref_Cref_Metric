@@ -20,7 +20,36 @@ python /data/benchmark_metrics/concat2seeMetric.py \
   --folders  /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen-edit \
   --jsons /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/clipcap_out.json  /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/laion_scores.json /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/v25_scores.json \
   --out_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/vis_other \
-  --long_side 512
+  --long_side 512 \
+  --caption_json /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/prompts.json
+
+指令遵循可视化：
+python /data/benchmark_metrics/concat2seeMetric.py \
+  --folders /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen-edit \
+  --jsons /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/follow_scores.json \
+  --out_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/vis_follow_new_1 \
+  --long_side 512 \
+  --caption_json /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/prompts.json \
+    /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/follow_scores.json \
+    /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/follow_reasons.json
+
+风格相似度可视化：
+python /data/benchmark_metrics/concat2seeMetric.py \
+  --folders /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/sref /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen-edit \
+  --jsons /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen-edit/qwen_resize_output_style_descrete.json\
+  --out_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/vis_style_vlm \
+  --long_side 512 \
+  --caption_json /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen-edit/qwen_resize_output_style_reason_descrete.json
+
+内容相似度可视化：
+python /data/benchmark_metrics/concat2seeMetric.py \
+  --folders /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/cref /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen-edit \
+  --jsons /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen-edit/qwen_resize_output_content_descrete.json \
+  --out_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/vis_content_vlm \
+  --long_side 512 \
+    --caption_json /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen-edit/qwen_resize_output_content_reason_descrete.json
+
+
 """
 import argparse
 import json
@@ -202,6 +231,7 @@ def process_stem(payload):
         min_font,
         start_font,
         strict,
+        caption_map,
     ) = payload
     folders = [Path(p) for p in folder_paths]
     out_dir = Path(out_dir)
@@ -239,6 +269,15 @@ def process_stem(payload):
     canvas = draw_center_text(canvas, lines, min_font=min_font, start_font=start_font)
     out_path = out_dir / f"{stem}.png"
     canvas.save(out_path)
+    if isinstance(caption_map, dict) and stem in caption_map:
+        txt_path = out_dir / f"{stem}.txt"
+        val = caption_map.get(stem, "")
+        if isinstance(val, list):
+            val = "\n".join(str(x) for x in val)
+        elif not isinstance(val, str):
+            val = str(val)
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(val)
     return ("done", stem)
 
 
@@ -252,7 +291,8 @@ def main():
     ap.add_argument("--min_font", type=int, default=18, help="Minimum font size (default: 18).")
     ap.add_argument("--start_font", type=int, default=0, help="Start font size (0 means auto).")
     ap.add_argument("--strict", action="store_true", help="If set, skip stems missing in any folder or any json.")
-    ap.add_argument("--num_procs", type=int, default=4, help="Number of processes (default: 4).")
+    ap.add_argument("--num_procs", type=int, default=16, help="Number of processes (default: 4).")
+    ap.add_argument("--caption_json", nargs="*", default=[], help="Optional caption json path(s) {stem: caption}. If set, write txt.")
     args = ap.parse_args()
 
     folders = [Path(p) for p in args.folders]
@@ -275,6 +315,17 @@ def main():
         json_dicts.append((name, d))
         all_keys.update(d.keys())
 
+    caption_map: Dict[str, List[object]] = {}
+    if args.caption_json:
+        for jp in args.caption_json:
+            p = Path(jp)
+            with open(p, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if not isinstance(d, dict):
+                raise ValueError(f"{jp} is not a dict json.")
+            for k, v in d.items():
+                caption_map.setdefault(k, []).append(v)
+
     # Iterate keys (sorted for determinism)
     keys = sorted(all_keys)
 
@@ -294,6 +345,7 @@ def main():
             args.min_font,
             start_font,
             args.strict,
+            caption_map,
         )
         for stem in keys
     ]

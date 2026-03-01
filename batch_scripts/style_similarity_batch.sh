@@ -1,7 +1,7 @@
-style_dir="/mnt/jfs/bench-bucket/sref_bench/sample_1500_bench_cref_sref/sref"
-result_dir="/mnt/jfs/bench-bucket/sref_bench/sample_1500_bench_cref_sref/qwen_output_resize"
-output_json_style_discrete="s3://lanjinghong-data/sample_1500_bench_cref_sref/qwen_resize_output_style_descrete.json"
-reason_json_style_discrete="s3://lanjinghong-data/sample_1500_bench_cref_sref/qwen_resize_output_style_reason_descrete.json"
+style_dir="/mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/sref"
+result_dir="/mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen-edit"
+output_json_style_discrete="/mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen-edit/qwen_resize_output_style_descrete.json"
+reason_json_style_discrete="/mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen-edit/qwen_resize_output_style_reason_descrete.json"
 xingpeng_ip=http://stepcloud-apisix-gateway-eval.i-stepfun.com/Qwen3-VL-235B-A22B-W8A8/v1
 xingpeng_model=qwen3vlw8a8
 python3 /data/benchmark_metrics/vlm_similarity/style_similarity_dir.py \
@@ -11,5 +11,5 @@ python3 /data/benchmark_metrics/vlm_similarity/style_similarity_dir.py \
   --out_reason_json $reason_json_style_discrete \
   --base_url $xingpeng_ip \
   --model $xingpeng_model \
-  --num_samples 100 \
-  --num_procs 32
+  --num_procs 32 \
+  --overwrite

@@ -4,12 +4,6 @@
 import os
 from typing import Optional, List
 
-import torch
-from PIL import Image
-from transformers import SiglipVisionModel, SiglipImageProcessor
-
-from uso.flux.pipeline import USOPipeline, preprocess_ref
-
 # =========================
 # 硬编码输入与超参
 # =========================
@@ -21,8 +15,13 @@ os.environ["AE"] = "/data/USO/weights/FLUX.1-dev/ae.safetensors"
 os.environ["LORA"] = "/data/USO/weights/USO/uso_flux_v1.0/dit_lora.safetensors"
 os.environ["PROJECTION_MODEL"] = "/data/USO/weights/USO/uso_flux_v1.0/projector.safetensors"
 os.environ["SIGLIP_PATH"] = "/data/USO/weights/siglip"
-os.environ["T5"] = "/data/USO/weights/t5-xxl"
+os.environ["T5"] = "/mnt/jfs/model_zoo/t5-v1_1-xxl/"
 os.environ["CLIP"] = "/mnt/jfs/model_zoo/clip-vit-large-patch14/"
+
+import torch
+from PIL import Image
+from transformers import SiglipVisionModel, SiglipImageProcessor
+from uso.flux.pipeline import USOPipeline, preprocess_ref
 
 SUBJECT_PATH = "/data/benchmark_metrics/assets/content.webp"
 STYLE_PATH   = "/data/benchmark_metrics/assets/style.webp"

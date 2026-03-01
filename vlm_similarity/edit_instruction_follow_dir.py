@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from codecs import raw_unicode_escape_decode
 import os
 import re
 import json
@@ -96,6 +97,17 @@ def build_messages(img_path: str, instruction: str):
     return [{"role": "user", "content": content}]
 
 
+def select_instruction_text(text: str, mode: str) -> str:
+    mode = (mode or "full").lower()
+    s = text or ""
+    if mode == "first_sentence":
+        parts = s.split(".", 1)
+        return parts[0].strip()
+    if mode == "full":
+        return s
+    raise ValueError(f"Unsupported instruction_text_mode: {mode}")
+
+
 def run_follow_score(
     client: OpenAI,
     model: str,
@@ -120,14 +132,6 @@ def run_follow_score(
 
 def is_image_name(name: str) -> bool:
     return os.path.splitext(name)[1].lower() in IMG_EXTS
-
-
-def sort_key(name: str):
-    base = os.path.splitext(os.path.basename(name))[0]
-    nums = re.findall(r"\d+", base)
-    if nums:
-        return int(nums[0])
-    return base
 
 
 def _worker_process(
@@ -185,6 +189,7 @@ def main():
     parser.add_argument("--num_samples", type=int, default=0)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--instruction_text_mode", choices=["full", "first_sentence"], default="full")
     args = parser.parse_args()
 
     if not smart_exists(args.prompt_json):
@@ -200,7 +205,7 @@ def main():
 
     image_files = set(smart_listdir(args.image_dir))
     image_files = [f for f in image_files if is_image_name(f)]
-    image_files = sorted(image_files, key=sort_key)
+    image_files = list(image_files)
 
     tasks = []
     for name in image_files:
@@ -208,14 +213,16 @@ def main():
         instruction = prompt_map.get(base)
         if not isinstance(instruction, str) or not instruction.strip():
             continue
+        instruction_text = select_instruction_text(instruction.strip(), args.instruction_text_mode)
+        if not instruction_text:
+            continue
         image_path = args.image_dir.rstrip("/") + "/" + name
-        tasks.append((base, image_path, instruction.strip()))
+        tasks.append((base, image_path, instruction_text))
 
     if args.num_samples > 0 and len(tasks) > args.num_samples:
         import random
         random.seed(args.seed)
         tasks = random.sample(tasks, args.num_samples)
-        tasks = sorted(tasks, key=lambda x: sort_key(x[0]))
 
     score_results = {}
     reason_results = {}
@@ -236,14 +243,13 @@ def main():
             if isinstance(score_results, dict) and isinstance(reason_results, dict):
                 processed_keys = set(score_results.keys()) & set(reason_results.keys())
                 tasks = [t for t in tasks if t[0] not in processed_keys]
-                tasks = sorted(tasks, key=lambda x: sort_key(x[0]))
         except Exception:
             score_results = {}
             reason_results = {}
 
     if not tasks:
-        smart_write_json(args.out_score_json, dict(sorted(score_results.items(), key=lambda x: sort_key(x[0]))))
-        smart_write_json(args.out_reason_json, dict(sorted(reason_results.items(), key=lambda x: sort_key(x[0]))))
+        smart_write_json(args.out_score_json, score_results)
+        smart_write_json(args.out_reason_json, reason_results)
         return
 
     num_procs = max(1, int(args.num_procs))
@@ -281,8 +287,8 @@ def main():
                 total_done += 1
                 pbar.update(1)
                 if total_done % 50 == 0:
-                    smart_write_json(args.out_score_json, dict(sorted(score_results.items(), key=lambda x: sort_key(x[0]))))
-                    smart_write_json(args.out_reason_json, dict(sorted(reason_results.items(), key=lambda x: sort_key(x[0]))))
+                    smart_write_json(args.out_score_json, score_results)
+                    smart_write_json(args.out_reason_json, reason_results)
             except Exception:
                 if not any(p.is_alive() for p in workers) and result_queue.empty():
                     break
@@ -290,8 +296,8 @@ def main():
     for p in workers:
         p.join()
 
-    smart_write_json(args.out_score_json, dict(sorted(score_results.items(), key=lambda x: sort_key(x[0]))))
-    smart_write_json(args.out_reason_json, dict(sorted(reason_results.items(), key=lambda x: sort_key(x[0]))))
+    smart_write_json(args.out_score_json, score_results)
+    smart_write_json(args.out_reason_json, reason_results)
 
 
 if __name__ == "__main__":

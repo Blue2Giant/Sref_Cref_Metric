@@ -162,14 +162,6 @@ def is_image_name(name: str) -> bool:
     return os.path.splitext(name)[1].lower() in IMG_EXTS
 
 
-def sort_key(name: str):
-    base = os.path.splitext(os.path.basename(name))[0]
-    nums = re.findall(r"\d+", base)
-    if nums:
-        return int(nums[0])
-    return base
-
-
 def _worker_process(
     model: str,
     base_url: str,
@@ -229,14 +221,13 @@ def main():
 
     style_files = set(smart_listdir(args.style_dir))
     output_files = set(smart_listdir(args.output_dir))
-    common_files = sorted(list(style_files & output_files), key=sort_key)
+    common_files = list(style_files & output_files)
     common_files = [f for f in common_files if is_image_name(f)]
 
     if args.num_samples > 0 and len(common_files) > args.num_samples:
         import random
         random.seed(args.seed)
         common_files = random.sample(common_files, args.num_samples)
-        common_files = sorted(common_files, key=sort_key)
 
     score_results = {}
     reason_results = {}
@@ -261,13 +252,12 @@ def main():
                 reason_results = existing_reason
                 processed_keys = set(existing_score.keys()) & set(existing_reason.keys())
                 common_files = [f for f in common_files if os.path.splitext(f)[0] not in processed_keys]
-                common_files = sorted(common_files, key=sort_key)
         except Exception:
             pass
 
     if not common_files:
-        smart_write_json(args.out_score_json, dict(sorted(score_results.items(), key=lambda x: sort_key(x[0]))))
-        smart_write_json(args.out_reason_json, dict(sorted(reason_results.items(), key=lambda x: sort_key(x[0]))))
+        smart_write_json(args.out_score_json, score_results)
+        smart_write_json(args.out_reason_json, reason_results)
         return
 
     tasks = []
@@ -312,8 +302,8 @@ def main():
                 total_done += 1
                 pbar.update(1)
                 if total_done % 50 == 0:
-                    smart_write_json(args.out_score_json, dict(sorted(score_results.items(), key=lambda x: sort_key(x[0]))))
-                    smart_write_json(args.out_reason_json, dict(sorted(reason_results.items(), key=lambda x: sort_key(x[0]))))
+                    smart_write_json(args.out_score_json, score_results)
+                    smart_write_json(args.out_reason_json, reason_results)
             except Exception:
                 if not any(p.is_alive() for p in workers) and result_queue.empty():
                     break
@@ -321,8 +311,8 @@ def main():
     for p in workers:
         p.join()
 
-    smart_write_json(args.out_score_json, dict(sorted(score_results.items(), key=lambda x: sort_key(x[0]))))
-    smart_write_json(args.out_reason_json, dict(sorted(reason_results.items(), key=lambda x: sort_key(x[0]))))
+    smart_write_json(args.out_score_json, score_results)
+    smart_write_json(args.out_reason_json, reason_results)
 
 
 if __name__ == "__main__":

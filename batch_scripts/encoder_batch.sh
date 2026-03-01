@@ -40,7 +40,8 @@ overwrite=1
 #   --csd_model_path $CSD_MODEL \
 #   --device cuda \
 #   --gpus "$GPUS" \
-#   --overwrite $overwrite
+#   --overwrite $overwrite \
+#     --sim_metric l2
 
 # echo "=== oneig ===="
 # python3 "$RUNNER_PY" pair \
@@ -50,7 +51,8 @@ overwrite=1
 #   --model "$ONEIG_MODEL" \
 #   --out_json "$OUT_ONEIG_JSON" \
 #   --gpus "$GPUS" \
-#   --overwrite $overwrite
+#   --overwrite $overwrite \
+#     --sim_metric l2
 
 # #内容一致性
 # echo "=== dinov2 ===="
@@ -80,28 +82,29 @@ python3 "$RUNNER_PY" clip_cap \
   --out_json "$OUT_CLIPCAP_JSON" \
   --model "$CLIPCAP_MODEL" \
   --gpus "$GPUS" \
+  --clipcap_text_mode first_sentence \
   --overwrite $overwrite
 
 #美学评分
-echo "=== laion aesthetic ==="
-python /data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py aesthetic \
-  --backend laion \
-  --image_dir $RESULT_DIR \
-  --out_json $OUT_LAION_JSON \
-  --laion_clip_model ViT-L-14 \
-  --laion_clip_ckpt /mnt/jfs/model_zoo/open_clip/open_clip_model_ea4f182e96863ce2a27be5067cdb54d4.safetensors \
-  --laion_linear_path ~/.cache/emb_reader/sa_0_4_vit_l_14_linear.pth \
-  --device cuda \
-  --gpus 0 \
-  --overwrite $overwrite
+# echo "=== laion aesthetic ==="
+# python /data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py aesthetic \
+#   --backend laion \
+#   --image_dir $RESULT_DIR \
+#   --out_json $OUT_LAION_JSON \
+#   --laion_clip_model ViT-L-14 \
+#   --laion_clip_ckpt /mnt/jfs/model_zoo/open_clip/open_clip_model_ea4f182e96863ce2a27be5067cdb54d4.safetensors \
+#   --laion_linear_path ~/.cache/emb_reader/sa_0_4_vit_l_14_linear.pth \
+#   --device cuda \
+#   --gpus 0 \
+#   --overwrite $overwrite
 
-echo "==== aesthetic v25 ===="
-python /data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py aesthetic \
-  --backend v25 \
-  --image_dir $RESULT_DIR \
-  --out_json $OUT_V25_AESTHETIC \
-  --v25_encoder_model_name /mnt/jfs/model_zoo/siglip-so400m-patch14-384/ \
-  --dtype bfloat16 \
-  --device cuda \
-  --gpus 0 \
-  --overwrite $overwrite
+# echo "==== aesthetic v25 ===="
+# python /data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py aesthetic \
+#   --backend v25 \
+#   --image_dir $RESULT_DIR \
+#   --out_json $OUT_V25_AESTHETIC \
+#   --v25_encoder_model_name /mnt/jfs/model_zoo/siglip-so400m-patch14-384/ \
+#   --dtype bfloat16 \
+#   --device cuda \
+#   --gpus 0 \
+#   --overwrite $overwrite

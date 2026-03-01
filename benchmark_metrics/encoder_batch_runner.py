@@ -62,6 +62,19 @@ def load_json(path: str) -> Dict[str, Any]:
         return {}
 
 
+def parse_overwrite(val) -> bool:
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return False
+    s = str(val).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid overwrite value: {val}")
+
+
 def normalize_cosine_score(value: float) -> float:
     v = (float(value) + 1.0) / 2.0
     if v < 0.0:
@@ -71,8 +84,25 @@ def normalize_cosine_score(value: float) -> float:
     return v
 
 
+def compute_similarity(vec_a: torch.Tensor, vec_b: torch.Tensor, metric: str) -> float:
+    metric = (metric or "cosine01").lower()
+    if metric in {"cosine", "cosine01", "l2"}:
+        vec_a = vec_a / vec_a.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        vec_b = vec_b / vec_b.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    if metric == "cosine":
+        return float((vec_a * vec_b).sum(dim=-1).item())
+    if metric == "cosine01":
+        return normalize_cosine_score((vec_a * vec_b).sum(dim=-1).item())
+    if metric == "l2":
+        dist = torch.norm(vec_a - vec_b, dim=-1).item()
+        return 1.0 / (1.0 + float(dist))
+    if metric == "dot":
+        return float((vec_a * vec_b).sum(dim=-1).item())
+    raise ValueError(f"Unsupported sim_metric: {metric}")
+
+
 @torch.no_grad()
-def dinov2_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, device: str, size: int) -> float:
+def dinov2_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, device: str, size: int, sim_metric: str) -> float:
     inputs_a = processor(
         images=img_a, return_tensors="pt",
         do_resize=True, size={"height": size, "width": size},
@@ -87,9 +117,7 @@ def dinov2_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, 
     tokens_b = model(pixel_values=inputs_b["pixel_values"].to(device)).last_hidden_state[:, 1:, :]
     vec_a = tokens_a.mean(dim=1)
     vec_b = tokens_b.mean(dim=1)
-    vec_a = vec_a / vec_a.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    vec_b = vec_b / vec_b.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    return normalize_cosine_score((vec_a * vec_b).sum(dim=-1).item())
+    return compute_similarity(vec_a, vec_b, sim_metric)
 
 
 def cas_mean_std(feat, eps=1e-5):
@@ -124,14 +152,12 @@ def cas_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, dev
 
 
 @torch.no_grad()
-def oneig_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, device: str, dtype) -> float:
+def oneig_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, device: str, dtype, sim_metric: str) -> float:
     inputs_a = processor(images=img_a, return_tensors="pt").pixel_values.to(device, dtype=dtype)
     inputs_b = processor(images=img_b, return_tensors="pt").pixel_values.to(device, dtype=dtype)
     embeds_a = model(inputs_a).image_embeds
     embeds_b = model(inputs_b).image_embeds
-    embeds_a = torch.nn.functional.normalize(embeds_a, p=2, dim=-1)
-    embeds_b = torch.nn.functional.normalize(embeds_b, p=2, dim=-1)
-    return normalize_cosine_score((embeds_a * embeds_b).sum(dim=-1).item())
+    return compute_similarity(embeds_a, embeds_b, sim_metric)
 
 
 def build_csd_model(arch: str, model_path: str, device: str):
@@ -148,7 +174,7 @@ def build_csd_model(arch: str, model_path: str, device: str):
 
 
 @torch.no_grad()
-def csd_similarity(img_a: Image.Image, img_b: Image.Image, preprocess, model, device: str) -> float:
+def csd_similarity(img_a: Image.Image, img_b: Image.Image, preprocess, model, device: str, sim_metric: str) -> float:
     x_a = preprocess(img_a).unsqueeze(0).to(device)
     x_b = preprocess(img_b).unsqueeze(0).to(device)
     if hasattr(model, "encode_image"):
@@ -166,21 +192,28 @@ def csd_similarity(img_a: Image.Image, img_b: Image.Image, preprocess, model, de
         fa = fa.flatten(1)
     if fb.ndim > 2:
         fb = fb.flatten(1)
-    fa = torch.nn.functional.normalize(fa, dim=1)
-    fb = torch.nn.functional.normalize(fb, dim=1)
-    return normalize_cosine_score((fa * fb).sum(dim=-1).item())
+    return compute_similarity(fa, fb, sim_metric)
 
 
 @torch.no_grad()
-def clip_image_text_similarity(image: Image.Image, caption: str, processor: CLIPProcessor, model: CLIPModel, device: str) -> float:
+def clip_image_text_similarity(image: Image.Image, caption: str, processor: CLIPProcessor, model: CLIPModel, device: str, sim_metric: str) -> float:
     inputs = processor(text=[caption], images=image, return_tensors="pt", padding=True)
     inputs = {k: v.to(device) for k, v in inputs.items()}
     outputs = model(**inputs)
     image_embeds = outputs.image_embeds
     text_embeds = outputs.text_embeds
-    image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    return normalize_cosine_score((image_embeds * text_embeds).sum(dim=-1).item())
+    return compute_similarity(image_embeds, text_embeds, sim_metric)
+
+
+def select_clipcap_text(caption: str, mode: str) -> str:
+    mode = (mode or "full").lower()
+    text = caption or ""
+    if mode == "first_sentence":
+        parts = text.split(".", 1)
+        return parts[0].strip()
+    if mode == "full":
+        return text
+    raise ValueError(f"Unsupported clipcap_text_mode: {mode}")
 
 
 def build_tasks_pair(dir_a: str, dir_b: str) -> List[Tuple[str, str, str]]:
@@ -277,10 +310,11 @@ def worker_pair(encoder: str, args_dict: dict, tasks: List[Tuple[str, str, str]]
         model = AutoModel.from_pretrained(args_dict["model"]).to(device)
         model.eval()
         size = args_dict["size"]
+        sim_metric = args_dict["sim_metric"]
         for k, p1, p2 in tasks:
             img_a = read_image(p1)
             img_b = read_image(p2)
-            score = dinov2_similarity(img_a, img_b, processor, model, device, size)
+            score = dinov2_similarity(img_a, img_b, processor, model, device, size, sim_metric)
             out_queue.put((k, score))
         return
     if encoder == "cas":
@@ -299,18 +333,20 @@ def worker_pair(encoder: str, args_dict: dict, tasks: List[Tuple[str, str, str]]
         processor = CLIPImageProcessor()
         model = CLIPVisionModelWithProjection.from_pretrained(args_dict["model"]).to(device, dtype=args_dict["dtype"])
         model.eval()
+        sim_metric = args_dict["sim_metric"]
         for k, p1, p2 in tasks:
             img_a = read_image(p1)
             img_b = read_image(p2)
-            score = oneig_similarity(img_a, img_b, processor, model, device, args_dict["dtype"])
+            score = oneig_similarity(img_a, img_b, processor, model, device, args_dict["dtype"], sim_metric)
             out_queue.put((k, score))
         return
     if encoder == "csd":
         model, preprocess = build_csd_model(args_dict["arch"], args_dict["model_path"], device)
+        sim_metric = args_dict["sim_metric"]
         for k, p1, p2 in tasks:
             img_a = read_image(p1)
             img_b = read_image(p2)
-            score = csd_similarity(img_a, img_b, preprocess, model, device)
+            score = csd_similarity(img_a, img_b, preprocess, model, device, sim_metric)
             out_queue.put((k, score))
         return
     raise ValueError(f"Unsupported encoder: {encoder}")
@@ -322,9 +358,12 @@ def worker_clipcap(args_dict: dict, tasks: List[Tuple[str, str, str]], out_queue
     processor = CLIPProcessor.from_pretrained(args_dict["model"])
     model = CLIPModel.from_pretrained(args_dict["model"]).to(device)
     model.eval()
+    sim_metric = args_dict["sim_metric"]
+    text_mode = args_dict["clipcap_text_mode"]
     for k, img_path, caption in tasks:
         img = read_image(img_path)
-        score = clip_image_text_similarity(img, caption, processor, model, device)
+        text = select_clipcap_text(caption, text_mode)
+        score = clip_image_text_similarity(img, text, processor, model, device, sim_metric)
         out_queue.put((k, score))
 
 
@@ -457,7 +496,8 @@ def main():
     ap_pair.add_argument("--dtype", default="bfloat16")
     ap_pair.add_argument("--num_procs", type=int, default=4)
     ap_pair.add_argument("--gpus", default="")
-    ap_pair.add_argument("--overwrite", type=bool, default=0)
+    ap_pair.add_argument("--overwrite", type=parse_overwrite, default=False)
+    ap_pair.add_argument("--sim_metric", choices=["cosine", "cosine01", "l2", "dot"], default="cosine01")
     ap_pair.add_argument("--csd_arch", default="vit_base")
     ap_pair.add_argument("--csd_model_path", default="")
 
@@ -469,7 +509,9 @@ def main():
     ap_clip.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap_clip.add_argument("--num_procs", type=int, default=4)
     ap_clip.add_argument("--gpus", default="")
-    ap_clip.add_argument("--overwrite", action="store_true")
+    ap_clip.add_argument("--overwrite", type=parse_overwrite, default=False)
+    ap_clip.add_argument("--sim_metric", choices=["cosine", "cosine01", "l2", "dot"], default="cosine01")
+    ap_clip.add_argument("--clipcap_text_mode", choices=["full", "first_sentence"], default="full")
 
     ap_one = sub.add_parser("onealign")
     ap_one.add_argument("--image_dir", required=True)
@@ -479,7 +521,7 @@ def main():
     ap_one.add_argument("--dtype", default="float16")
     ap_one.add_argument("--num_procs", type=int, default=4)
     ap_one.add_argument("--gpus", default="")
-    ap_one.add_argument("--overwrite", type=bool, default=0)
+    ap_one.add_argument("--overwrite", type=parse_overwrite, default=False)
     ap_aes = sub.add_parser("aesthetic")
     ap_aes.add_argument("--backend", choices=["laion", "v25"], required=True)
     ap_aes.add_argument("--image_dir", required=True)
@@ -487,6 +529,7 @@ def main():
     ap_aes.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap_aes.add_argument("--num_procs", type=int, default=4)
     ap_aes.add_argument("--gpus", default="")
+    ap_aes.add_argument("--overwrite", type=parse_overwrite, default=False)
     ap_aes.add_argument("--laion_clip_model", default="ViT-L-14")
     ap_aes.add_argument("--laion_clip_ckpt", default="/mnt/jfs/model_zoo/open_clip/open_clip_model_ea4f182e96863ce2a27be5067cdb54d4.safetensors")
     ap_aes.add_argument("--laion_pretrained_tag", default="openai")
@@ -507,6 +550,7 @@ def main():
             "dtype": dtype,
             "num_procs": args.num_procs,
             "gpus": args.gpus,
+            "sim_metric": args.sim_metric,
             "arch": args.csd_arch,
             "model_path": args.csd_model_path,
         }
@@ -522,6 +566,8 @@ def main():
             "device": args.device,
             "num_procs": args.num_procs,
             "gpus": args.gpus,
+            "sim_metric": args.sim_metric,
+            "clipcap_text_mode": args.clipcap_text_mode,
         }
         run_batch(tasks, args.out_json, args.overwrite, worker_clipcap, args_dict)
         return

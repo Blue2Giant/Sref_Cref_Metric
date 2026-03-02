@@ -28,23 +28,46 @@ You will be given:
 2) An editing instruction (prompt).
 
 Task:
-Rate from 0 to 10 how well the final image fulfills the editing instruction, regardless of whether subject identities or the original scene are preserved.
-Ignore visual style differences such as rendering style, brushwork, lighting mood, color grading, resolution, noise, and aesthetics.
-Focus strictly on whether the instruction is implemented in the image content, objects, attributes, actions, layout, and any specified text/logos.
+Score how well the final image follows the instruction, from 0 to 10.
+Give PARTIAL CREDIT whenever the image implements some parts correctly.
+Do NOT assume anything that is not clearly visible in the image.
 
-Scoring rubric (0–10):
-0: The image completely fails to implement the instruction.
-1–3: The image responds to the instruction mostly incorrectly.
-4–6: The image reflects parts of the instruction, but with significant omissions or incorrectly applied details.
-7–9: The image mostly fulfills the instruction, with only a few minor issues.
-10: The image fully and accurately meets all aspects of the instruction.
+Important evaluation rule:
+- Ignore style/aesthetic differences (rendering style, brushwork, resolution, noise, overall beauty)
+  ONLY IF the instruction does NOT explicitly ask for them.
+- If the instruction explicitly mentions color, lighting, mood, style, lens, texture, etc.,
+  then you MUST evaluate those aspects (do NOT ignore them).
+
+How to score (internal steps; do not output these steps):
+1) Break the instruction into atomic, checkable requirements:
+   - main subject(s) / objects
+   - key attributes (color, material, count, size, identity if specified)
+   - actions / interactions
+   - spatial/layout constraints (left/right, background, position)
+   - any required text/logos (exact wording matters)
+   Mark each requirement as MUST-HAVE or NICE-TO-HAVE.
+2) For each requirement, judge: satisfied / partially satisfied / not satisfied / contradicted.
+3) Combine into a final score using this guidance:
+   - Start from 10 and subtract penalties:
+     * Missing a MUST-HAVE requirement: -2 to -4 (bigger miss = bigger penalty)
+     * Partially meeting a MUST-HAVE: -1 to -2
+     * Minor detail wrong (NICE-TO-HAVE): -0.5 to -1
+     * Direct contradiction (e.g., asked to add X but image removes X): -3 to -5
+     * Wrong or missing required text/logo: -3 to -6
+   Clamp the result to [0, 10].
+
+Score anchors (use these to avoid extreme scores):
+- 9–10: All MUST-HAVEs satisfied; at most tiny minor issues. Use 10 ONLY if nothing important is missing or wrong.
+- 7–8.5: Most MUST-HAVEs satisfied; 1–2 notable misses or several small issues.
+- 4–6.5: Some key parts are implemented, but major omissions/misapplied edits exist.
+- 1–3.5: Slight relation, but most MUST-HAVEs are missing/wrong.
+- 0–0.5: Completely unrelated or clearly opposite to the instruction. Use 0 ONLY when it is truly a total failure.
 
 Output rules (very important):
 * Output ONLY one line in the format: score@reason
-* score must be an integer from 0 to 10.
-* reason must be 1-2 short sentences, specific and observable.
+* score must be a number from 0 to 10, allowing .5 steps (e.g., 7.5). Do NOT always use 0 or 10.
+* reason must be 1-2 short sentences, specific and directly observable (mention 1-2 key satisfied/missed requirements).
 """.strip()
-
 
 def path_to_data_url(path: str) -> str:
     mime, _ = mimetypes.guess_type(path)
@@ -78,11 +101,19 @@ def parse_score_reason(raw_text: str) -> Dict[str, Any]:
     if not clean:
         raise ValueError("模型输出为空")
     first_line = clean.splitlines()[0].strip()
-    m = re.match(r"^\s*(\d{1,2})\s*@\s*(.+?)\s*$", first_line)
-    if not m:
+    if "@" not in first_line:
         raise ValueError(f"输出不符合 score@reason: {first_line!r}")
-    score = _clamp_score_0_10(int(m.group(1)))
-    reason = m.group(2).strip()
+    score_text, reason = first_line.split("@", 1)
+    score_text = score_text.strip()
+    reason = reason.strip()
+    try:
+        score = float(score_text)
+    except Exception as e:
+        raise ValueError(f"score 不是数字: {score_text!r}") from e
+    if score < 0.0:
+        score = 0.0
+    if score > 10.0:
+        score = 10.0
     if not reason:
         raise ValueError("reason 为空")
     return {"score": score, "reason": reason}
@@ -126,6 +157,7 @@ def run_follow_score(
     try:
         parsed = parse_score_reason(raw)
     except Exception as e:
+        print(f"解析模型输出失败: {raw!r},path={img_path}")
         return raw, None, {"error": str(e)}
     return raw, parsed, None
 

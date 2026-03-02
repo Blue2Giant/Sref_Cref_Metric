@@ -16,5 +16,5 @@ python3 /data/benchmark_metrics/vlm_similarity/edit_instruction_follow_dir.py \
   --model $xingpeng_model \
   --api_key YOUR_KEY \
   --instruction_text_mode first_sentence \
-  --num_procs 32 \
+  --num_procs 128 \
   --overwrite

@@ -11,11 +11,10 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 from transformers import AutoImageProcessor, AutoModel, AutoConfig
+from transformers import AutoProcessor, AutoTokenizer
 from transformers import CLIPProcessor, CLIPModel, CLIPImageProcessor, CLIPVisionModelWithProjection
 from transformers import AutoModelForCausalLM
-from CSD.model import CSD_CLIP
-from CSD.utils import has_batchnorms, convert_state_dict
-from CSD.loss_utils import transforms_branch0
+from csd_utils import CSDStyleEmbedding
 
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -157,42 +156,26 @@ def oneig_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, d
     inputs_b = processor(images=img_b, return_tensors="pt").pixel_values.to(device, dtype=dtype)
     embeds_a = model(inputs_a).image_embeds
     embeds_b = model(inputs_b).image_embeds
+    embeds_a = model()
     return compute_similarity(embeds_a, embeds_b, sim_metric)
 
 
-def build_csd_model(arch: str, model_path: str, device: str):
-    content_proj_head = "default"
-    model = CSD_CLIP(arch, content_proj_head)
-    if has_batchnorms(model):
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    ckpt = torch.load(model_path, map_location="cpu")
-    state_dict = convert_state_dict(ckpt["state_dict"])
-    model.load_state_dict(state_dict, strict=False)
-    model.eval().to(device)
-    preprocess = transforms_branch0
-    return model, preprocess
+def build_csd_encoder(model_path: str, device: str, clip_model_path: str):
+    clip_model_path = clip_model_path.strip() if clip_model_path else ""
+    clip_model_path = clip_model_path or None
+    return CSDStyleEmbedding(model_path=model_path, device=device, clip_model_path=clip_model_path)
 
 
 @torch.no_grad()
-def csd_similarity(img_a: Image.Image, img_b: Image.Image, preprocess, model, device: str, sim_metric: str) -> float:
-    x_a = preprocess(img_a).unsqueeze(0).to(device)
-    x_b = preprocess(img_b).unsqueeze(0).to(device)
-    if hasattr(model, "encode_image"):
-        fa = model.encode_image(x_a)
-        fb = model.encode_image(x_b)
-    elif hasattr(model, "forward_image"):
-        fa = model.forward_image(x_a)
-        fb = model.forward_image(x_b)
-    else:
-        fa = model(x_a)
-        fb = model(x_b)
-    fa = fa[-1].clone() if isinstance(fa, (list, tuple)) else fa
-    fb = fb[-1].clone() if isinstance(fb, (list, tuple)) else fb
-    if fa.ndim > 2:
-        fa = fa.flatten(1)
-    if fb.ndim > 2:
-        fb = fb.flatten(1)
-    return compute_similarity(fa, fb, sim_metric)
+def csd_similarity(img_a: Image.Image, img_b: Image.Image, encoder, device: str, sim_metric: str, size: int) -> float:
+    if size:
+        img_a = img_a.resize((size, size))
+        img_b = img_b.resize((size, size))
+    embed_a = encoder.get_style_embedding(img_a)
+    embed_b = encoder.get_style_embedding(img_b)
+    vec_a = torch.tensor(embed_a, device=device).unsqueeze(0)
+    vec_b = torch.tensor(embed_b, device=device).unsqueeze(0)
+    return compute_similarity(vec_a, vec_b, sim_metric)
 
 
 @torch.no_grad()
@@ -203,6 +186,17 @@ def clip_image_text_similarity(image: Image.Image, caption: str, processor: CLIP
     image_embeds = outputs.image_embeds
     text_embeds = outputs.text_embeds
     return compute_similarity(image_embeds, text_embeds, sim_metric)
+
+
+@torch.no_grad()
+def clip_t_similarity(image: Image.Image, text: str, processor, tokenizer, model, device: str, sim_metric: str) -> float:
+    image_inputs = processor(images=image, return_tensors="pt")
+    text_inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+    image_inputs = {k: v.to(device) for k, v in image_inputs.items()}
+    text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+    image_features = model.get_image_features(**image_inputs)
+    text_features = model.get_text_features(**text_inputs)
+    return compute_similarity(image_features, text_features, sim_metric)
 
 
 def select_clipcap_text(caption: str, mode: str) -> str:
@@ -224,6 +218,16 @@ def build_tasks_pair(dir_a: str, dir_b: str) -> List[Tuple[str, str, str]]:
 
 
 def build_tasks_clipcap(image_dir: str, prompt_json: str) -> List[Tuple[str, str, str]]:
+    with open(prompt_json, "r", encoding="utf-8") as f:
+        prompt_map = json.load(f)
+    if not isinstance(prompt_map, dict):
+        raise ValueError("prompt_json must be a dict")
+    image_map = list_images(image_dir)
+    keys = list(set(image_map.keys()) & set(prompt_map.keys()))
+    return [(k, image_map[k], str(prompt_map[k])) for k in keys]
+
+
+def build_tasks_clip_t(image_dir: str, prompt_json: str) -> List[Tuple[str, str, str]]:
     with open(prompt_json, "r", encoding="utf-8") as f:
         prompt_map = json.load(f)
     if not isinstance(prompt_map, dict):
@@ -341,12 +345,13 @@ def worker_pair(encoder: str, args_dict: dict, tasks: List[Tuple[str, str, str]]
             out_queue.put((k, score))
         return
     if encoder == "csd":
-        model, preprocess = build_csd_model(args_dict["arch"], args_dict["model_path"], device)
+        encoder = build_csd_encoder(args_dict["model_path"], device, args_dict["clip_model_path"])
         sim_metric = args_dict["sim_metric"]
+        size = args_dict.get("csd_size", 512)
         for k, p1, p2 in tasks:
             img_a = read_image(p1)
             img_b = read_image(p2)
-            score = csd_similarity(img_a, img_b, preprocess, model, device, sim_metric)
+            score = csd_similarity(img_a, img_b, encoder, device, sim_metric, size)
             out_queue.put((k, score))
         return
     raise ValueError(f"Unsupported encoder: {encoder}")
@@ -364,6 +369,22 @@ def worker_clipcap(args_dict: dict, tasks: List[Tuple[str, str, str]], out_queue
         img = read_image(img_path)
         text = select_clipcap_text(caption, text_mode)
         score = clip_image_text_similarity(img, text, processor, model, device, sim_metric)
+        out_queue.put((k, score))
+
+
+def worker_clip_t(args_dict: dict, tasks: List[Tuple[str, str, str]], out_queue: mp.Queue):
+    _setup_cuda_env(args_dict)
+    device = args_dict["device"]
+    model = AutoModel.from_pretrained(args_dict["model"]).to(device)
+    processor = AutoProcessor.from_pretrained(args_dict["model"])
+    tokenizer = AutoTokenizer.from_pretrained(args_dict["model"])
+    model.eval()
+    sim_metric = args_dict["sim_metric"]
+    text_mode = args_dict["clipcap_text_mode"]
+    for k, img_path, text in tasks:
+        img = read_image(img_path)
+        text = select_clipcap_text(text, text_mode)
+        score = clip_t_similarity(img, text, processor, tokenizer, model, device, sim_metric)
         out_queue.put((k, score))
 
 
@@ -500,6 +521,8 @@ def main():
     ap_pair.add_argument("--sim_metric", choices=["cosine", "cosine01", "l2", "dot"], default="cosine01")
     ap_pair.add_argument("--csd_arch", default="vit_base")
     ap_pair.add_argument("--csd_model_path", default="")
+    ap_pair.add_argument("--csd_clip_model_path", default="")
+    ap_pair.add_argument("--csd_size", type=int, default=512)
 
     ap_clip = sub.add_parser("clip_cap")
     ap_clip.add_argument("--image_dir", required=True)
@@ -512,6 +535,18 @@ def main():
     ap_clip.add_argument("--overwrite", type=parse_overwrite, default=False)
     ap_clip.add_argument("--sim_metric", choices=["cosine", "cosine01", "l2", "dot"], default="cosine01")
     ap_clip.add_argument("--clipcap_text_mode", choices=["full", "first_sentence"], default="full")
+
+    ap_clip_t = sub.add_parser("clip_t")
+    ap_clip_t.add_argument("--image_dir", required=True)
+    ap_clip_t.add_argument("--prompt_json", required=True)
+    ap_clip_t.add_argument("--out_json", required=True)
+    ap_clip_t.add_argument("--model", default="openai/clip-vit-base-patch32")
+    ap_clip_t.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap_clip_t.add_argument("--num_procs", type=int, default=4)
+    ap_clip_t.add_argument("--gpus", default="")
+    ap_clip_t.add_argument("--overwrite", type=parse_overwrite, default=False)
+    ap_clip_t.add_argument("--sim_metric", choices=["cosine", "cosine01", "l2", "dot"], default="cosine01")
+    ap_clip_t.add_argument("--clipcap_text_mode", choices=["full", "first_sentence"], default="full")
 
     ap_one = sub.add_parser("onealign")
     ap_one.add_argument("--image_dir", required=True)
@@ -553,6 +588,8 @@ def main():
             "sim_metric": args.sim_metric,
             "arch": args.csd_arch,
             "model_path": args.csd_model_path,
+            "clip_model_path": args.csd_clip_model_path,
+            "csd_size": args.csd_size,
         }
         if args.encoder == "csd" and not args.csd_model_path:
             raise SystemExit("--csd_model_path is required when encoder=csd")
@@ -570,6 +607,19 @@ def main():
             "clipcap_text_mode": args.clipcap_text_mode,
         }
         run_batch(tasks, args.out_json, args.overwrite, worker_clipcap, args_dict)
+        return
+
+    if args.mode == "clip_t":
+        tasks = build_tasks_clip_t(args.image_dir, args.prompt_json)
+        args_dict = {
+            "model": args.model,
+            "device": args.device,
+            "num_procs": args.num_procs,
+            "gpus": args.gpus,
+            "sim_metric": args.sim_metric,
+            "clipcap_text_mode": args.clipcap_text_mode,
+        }
+        run_batch(tasks, args.out_json, args.overwrite, worker_clip_t, args_dict)
         return
 
     if args.mode == "onealign":

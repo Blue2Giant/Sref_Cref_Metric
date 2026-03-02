@@ -5,6 +5,8 @@ RUNNER_PY="/data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py"
 GPUS="0"
 MODEL="uso"
 SREF_ROOT="/mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content"
+SREF_ROOT="/mnt/jfs/bench-bucket/sref_bench/sample_800_cref_sref_200_content"
+
 CONTENT_DIR="$SREF_ROOT/cref"
 STYLE_DIR="$SREF_ROOT/sref"
 RESULT_DIR="$SREF_ROOT/$MODEL"
@@ -28,120 +30,117 @@ OUT_CSD_JSON="$RESULT_DIR/csd_out.json"
 OUT_LAION_JSON="$RESULT_DIR/laion_scores.json"
 OUT_V25_AESTHETIC="$RESULT_DIR/v25_scores.json"
 overwrite=0
-# # 风格一致性
-# echo "==== CSD ===="
-# python3 "$RUNNER_PY" pair \
-#   --encoder csd \
-#   --dir_a "$STYLE_DIR" \
-#   --dir_b "$RESULT_DIR" \
-#   --out_json "$OUT_CSD_JSON" \
-#   --model dummy \
-#   --csd_arch vit_base \
-#   --csd_model_path $CSD_MODEL \
-#   --device cuda \
-#   --gpus "$GPUS" \
-#   --overwrite $overwrite \
-#     --sim_metric l2
+# 风格一致性
+echo "==== CSD ===="
+python3 "$RUNNER_PY" pair \
+  --encoder csd \
+  --dir_a "$STYLE_DIR" \
+  --dir_b "$RESULT_DIR" \
+  --out_json "$OUT_CSD_JSON" \
+  --model dummy \
+  --csd_model_path /data/benchmark_metrics/logs/csd.pth \
+  --csd_clip_model_path /data/benchmark_metrics/logs/ViT-L-14.pt \
+  --csd_size 512 \
+  --sim_metric cosine \
+  --overwrite $overwrite
 
-# echo "=== oneig ===="
-# python3 "$RUNNER_PY" pair \
-#   --encoder oneig \
-#   --dir_a "$STYLE_DIR" \
-#   --dir_b "$RESULT_DIR" \
-#   --model "$ONEIG_MODEL" \
-#   --out_json "$OUT_ONEIG_JSON" \
-#   --gpus "$GPUS" \
-#   --overwrite $overwrite \
-#     --sim_metric l2
+echo "=== oneig ===="
+python3 "$RUNNER_PY" pair \
+  --encoder oneig \
+  --dir_a "$STYLE_DIR" \
+  --dir_b "$RESULT_DIR" \
+  --model "$ONEIG_MODEL" \
+  --out_json "$OUT_ONEIG_JSON" \
+  --gpus "$GPUS" \
+  --overwrite $overwrite
+#内容一致性
+echo "=== dinov2 ===="
+python3 "$RUNNER_PY" pair \
+  --encoder dinov2 \
+  --dir_a "$CONTENT_DIR" \
+  --dir_b "$RESULT_DIR" \
+  --model "$DINOV2_MODEL" \
+  --out_json "$OUT_DINOV2_JSON" \
+  --gpus "$GPUS" \
+  --overwrite $overwrite
+echo "=== cas ===="
+python3 "$RUNNER_PY" pair \
+  --encoder cas \
+  --dir_a "$CONTENT_DIR" \
+  --dir_b "$RESULT_DIR" \
+  --model "$CAS_MODEL" \
+  --out_json "$OUT_CAS_JSON" \
+  --gpus "$GPUS" \
+  --overwrite $overwrite
 
-# #内容一致性
-# echo "=== dinov2 ===="
-# python3 "$RUNNER_PY" pair \
-#   --encoder dinov2 \
-#   --dir_a "$CONTENT_DIR" \
-#   --dir_b "$RESULT_DIR" \
-#   --model "$DINOV2_MODEL" \
-#   --out_json "$OUT_DINOV2_JSON" \
-#   --gpus "$GPUS" \
-#   --overwrite $overwrite
-# echo "=== cas ===="
-# python3 "$RUNNER_PY" pair \
-#   --encoder cas \
-#   --dir_a "$CONTENT_DIR" \
-#   --dir_b "$RESULT_DIR" \
-#   --model "$CAS_MODEL" \
-#   --out_json "$OUT_CAS_JSON" \
-#   --gpus "$GPUS" \
-#   --overwrite $overwrite
+#指令遵循
+echo "=== clip cap ==="
+python3 "$RUNNER_PY" clip_cap \
+  --image_dir "$RESULT_DIR" \
+  --prompt_json "$SREF_PROMPT" \
+  --out_json "$OUT_CLIPCAP_JSON" \
+  --model "$CLIPCAP_MODEL" \
+  --gpus "$GPUS" \
+  --clipcap_text_mode first_sentence \
+  --overwrite $overwrite
 
-# #指令遵循
-# echo "=== clip cap ==="
-# python3 "$RUNNER_PY" clip_cap \
-#   --image_dir "$RESULT_DIR" \
-#   --prompt_json "$SREF_PROMPT" \
-#   --out_json "$OUT_CLIPCAP_JSON" \
-#   --model "$CLIPCAP_MODEL" \
-#   --gpus "$GPUS" \
-#   --clipcap_text_mode first_sentence \
-#   --overwrite $overwrite
+#美学评分
+echo "=== laion aesthetic ==="
+python /data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py aesthetic \
+  --backend laion \
+  --image_dir $RESULT_DIR \
+  --out_json $OUT_LAION_JSON \
+  --laion_clip_model ViT-L-14 \
+  --laion_clip_ckpt /mnt/jfs/model_zoo/open_clip/open_clip_model_ea4f182e96863ce2a27be5067cdb54d4.safetensors \
+  --laion_linear_path ~/.cache/emb_reader/sa_0_4_vit_l_14_linear.pth \
+  --device cuda \
+  --gpus 0 \
+  --overwrite $overwrite
 
-# #美学评分
-# echo "=== laion aesthetic ==="
-# python /data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py aesthetic \
-#   --backend laion \
-#   --image_dir $RESULT_DIR \
-#   --out_json $OUT_LAION_JSON \
-#   --laion_clip_model ViT-L-14 \
-#   --laion_clip_ckpt /mnt/jfs/model_zoo/open_clip/open_clip_model_ea4f182e96863ce2a27be5067cdb54d4.safetensors \
-#   --laion_linear_path ~/.cache/emb_reader/sa_0_4_vit_l_14_linear.pth \
-#   --device cuda \
-#   --gpus 0 \
-#   --overwrite $overwrite
+echo "==== aesthetic v25 ===="
+python /data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py aesthetic \
+  --backend v25 \
+  --image_dir $RESULT_DIR \
+  --out_json $OUT_V25_AESTHETIC \
+  --v25_encoder_model_name /mnt/jfs/model_zoo/siglip-so400m-patch14-384/ \
+  --dtype bfloat16 \
+  --device cuda \
+  --gpus 0 \
+  --overwrite $overwrite
 
-# echo "==== aesthetic v25 ===="
-# python /data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py aesthetic \
-#   --backend v25 \
-#   --image_dir $RESULT_DIR \
-#   --out_json $OUT_V25_AESTHETIC \
-#   --v25_encoder_model_name /mnt/jfs/model_zoo/siglip-so400m-patch14-384/ \
-#   --dtype bfloat16 \
-#   --device cuda \
-#   --gpus 0 \
-#   --overwrite $overwrite
+echo "====vlm style===="
+style_dir="$SREF_ROOT/sref"
+result_dir="$SREF_ROOT/$MODEL"
+output_json_style_discrete="$SREF_ROOT/$MODEL/qwen_resize_output_style_descrete.json"
+reason_json_style_discrete="$SREF_ROOT/$MODEL/qwen_resize_output_style_reason_descrete.json"
+xingpeng_ip=http://stepcloud-apisix-gateway-eval.i-stepfun.com/Qwen3-VL-235B-A22B-W8A8/v1
+xingpeng_model=qwen3vlw8a8
+python3 /data/benchmark_metrics/vlm_similarity/style_similarity_dir.py \
+  --style_dir $style_dir \
+  --output_dir $result_dir \
+  --out_score_json $output_json_style_discrete \
+  --out_reason_json $reason_json_style_discrete \
+  --base_url $xingpeng_ip \
+  --model $xingpeng_model \
+  --num_procs 32 \
+  --overwrite
 
-# echo "====vlm style===="
-# style_dir="$SREF_ROOT/sref"
-# result_dir="$SREF_ROOT/$MODEL"
-# output_json_style_discrete="$SREF_ROOT/$MODEL/qwen_resize_output_style_descrete.json"
-# reason_json_style_discrete="$SREF_ROOT/$MODEL/qwen_resize_output_style_reason_descrete.json"
-# xingpeng_ip=http://stepcloud-apisix-gateway-eval.i-stepfun.com/Qwen3-VL-235B-A22B-W8A8/v1
-# xingpeng_model=qwen3vlw8a8
-# python3 /data/benchmark_metrics/vlm_similarity/style_similarity_dir.py \
-#   --style_dir $style_dir \
-#   --output_dir $result_dir \
-#   --out_score_json $output_json_style_discrete \
-#   --out_reason_json $reason_json_style_discrete \
-#   --base_url $xingpeng_ip \
-#   --model $xingpeng_model \
-#   --num_procs 32 \
-#   --overwrite
-
-# echo "====vlm content===="
-# content_dir="$SREF_ROOT/cref"
-# result_dir="$SREF_ROOT/$MODEL"
-# output_json_content_discrete="$SREF_ROOT/$MODEL/qwen_resize_output_content_descrete.json"
-# reason_json_content_discrete="$SREF_ROOT/$MODEL/qwen_resize_output_content_reason_descrete.json"
-# xingpeng_ip=http://stepcloud-apisix-gateway-eval.i-stepfun.com/Qwen3-VL-235B-A22B-W8A8/v1
-# xingpeng_model=qwen3vlw8a8
-# python3 /data/benchmark_metrics/vlm_similarity/content_similarity_dir.py \
-#   --content_dir $content_dir \
-#   --output_dir $result_dir \
-#   --out_json $output_json_content_discrete \
-#   --out_reason_json $reason_json_content_discrete \
-#   --base_url $xingpeng_ip \
-#   --model $xingpeng_model \
-#   --num_procs 64 \
-#   --overwrite
+echo "====vlm content===="
+content_dir="$SREF_ROOT/cref"
+result_dir="$SREF_ROOT/$MODEL"
+output_json_content_discrete="$SREF_ROOT/$MODEL/qwen_resize_output_content_descrete.json"
+reason_json_content_discrete="$SREF_ROOT/$MODEL/qwen_resize_output_content_reason_descrete.json"
+xingpeng_ip=http://stepcloud-apisix-gateway-eval.i-stepfun.com/Qwen3-VL-235B-A22B-W8A8/v1
+xingpeng_model=qwen3vlw8a8
+python3 /data/benchmark_metrics/vlm_similarity/content_similarity_dir.py \
+  --content_dir $content_dir \
+  --output_dir $result_dir \
+  --out_json $output_json_content_discrete \
+  --out_reason_json $reason_json_content_discrete \
+  --base_url $xingpeng_ip \
+  --model $xingpeng_model \
+  --num_procs 64 \
+  --overwrite
 
 echo "=== vlm insturction follow ==="
 OUT_SCORE_JSON="$SREF_ROOT/$MODEL/follow_scores.json"
@@ -172,5 +171,6 @@ python3 /data/benchmark_metrics/vlm_similarity/triplet_qwen_dual_judge.py \
     --output_content_json $output_json_content \
     --output_style_json $output_json_style \
     --endpoint "qwen3vlw8a8@http://stepcloud-apisix-gateway-eval.i-stepfun.com/Qwen3-VL-235B-A22B-W8A8/v1" \
-    --procs_per_endpoint 32
+    --procs_per_endpoint 32 \
+    --overwrite
     

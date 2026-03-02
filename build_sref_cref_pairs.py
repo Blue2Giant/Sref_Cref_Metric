@@ -1,5 +1,6 @@
 import argparse
 import json
+from ntpath import exists
 import os
 import random
 from io import BytesIO
@@ -29,6 +30,25 @@ python /data/benchmark_metrics/build_sref_cref_pairs.py \
   --num-combos 800 \
   --seed 200 \
   --max-side 2048 
+
+#数量补充逻辑
+python /data/benchmark_metrics/build_sref_cref_pairs.py \
+  --content-dir /mnt/jfs/bench-bucket/sref_bench/bench_0228_content_prompt_resize \
+  --style-dir /mnt/jfs/bench-bucket/sref_bench/bench_0222_style/bench_1022_style_resize/ \
+  --out-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content_backup  \
+  --num-combos 800 \
+  --seed 400 \
+  --max-side 2048 
+
+python /data/benchmark_metrics/build_sref_cref_pairs.py \
+  --content-dir /mnt/jfs/bench-bucket/sref_bench/bench_0228_content_prompt_resize \
+  --style-dir /mnt/jfs/bench-bucket/sref_bench/bench_0222_style/bench_1022_style_resize/ \
+  --out-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_cref_sref_200_content_backup  \
+  --num-combos 800 \
+  --max-side 2048 \
+  --use-style-prompt\
+  --resume_from_existing \
+  --seed 488
 """
 style_list=[
   "Please apply the style of the reference image.",
@@ -84,6 +104,13 @@ def list_images(dir_path: str, exts: List[str]) -> List[str]:
     return out
 
 
+def first_sentence(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return s
+    return s.split(".", 1)[0].strip()
+
+
 def read_edit_prompts(img_path: str) -> Optional[List[str]]:
     base = os.path.splitext(os.path.basename(img_path))[0]
     parent = os.path.dirname(img_path)
@@ -114,6 +141,31 @@ def read_edit_prompts(img_path: str) -> Optional[List[str]]:
     else:
         return None
     return cleaned if cleaned else None
+
+
+def load_existing_prompts(prompts_path: str) -> Dict[str, str]:
+    if not smart_exists(prompts_path):
+        return {}
+    try:
+        with mopen(prompts_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    return {str(k): str(v) for k, v in obj.items()}
+
+
+def build_used_prompts(existing_prompts: Dict[str, str]) -> Dict[str, set]:
+    used: Dict[str, set] = {}
+    for k, v in existing_prompts.items():
+        key = str(k)
+        content_id = key.split("__", 1)[0]
+        sent = first_sentence(str(v))
+        if not sent:
+            continue
+        used.setdefault(content_id, set()).add(sent)
+    return used
 
 
 def read_bytes(path: str) -> Optional[bytes]:
@@ -159,6 +211,8 @@ def main():
     ap.add_argument("--exts", default=".png,.jpg,.jpeg,.webp,.bmp,.avif")
     ap.add_argument("--max-side", type=int, default=2048)
     ap.add_argument("--use-style-prompt", action="store_true", help="If set, append a random style prompt to the content prompt.")
+    ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--resume_from_existing", action="store_true")
     args = ap.parse_args()
 
     exts = [x.strip().lower() for x in args.exts.split(",") if x.strip()]
@@ -181,62 +235,89 @@ def main():
     out_dir = args.out_dir.rstrip("/")
     cref_dir = join_path(out_dir, "cref")
     sref_dir = join_path(out_dir, "sref")
-    smart_makedirs(cref_dir)
-    smart_makedirs(sref_dir)
+    smart_makedirs(cref_dir,exist_ok=True)
+    smart_makedirs(sref_dir,exist_ok=True)
 
     rng = random.Random(args.seed)
     rng.shuffle(style_paths)
     
-    # Initialize tracking for unused prompts
-     # Map: content_path -> shuffled list of available prompts
+    prompts_path = join_path(out_dir, "prompts.json")
+    if args.overwrite:
+        existing_prompts = {}
+    elif args.resume_from_existing:
+        existing_prompts = load_existing_prompts(prompts_path)
+    else:
+        existing_prompts = {}
+    used_prompts = build_used_prompts(existing_prompts) if existing_prompts else {}
+    existing_keys = set(existing_prompts.keys())
+
     unused_prompts_map: Dict[str, List[str]] = {}
     for p, prompts in content_items:
-        # Create a copy and shuffle it so the order of usage is random
-        p_list = list(prompts)
+        content_id = os.path.splitext(os.path.basename(p))[0]
+        if used_prompts:
+            used_set = used_prompts.get(content_id, set())
+            p_list = [x for x in prompts if first_sentence(x) not in used_set]
+        else:
+            p_list = list(prompts)
         rng.shuffle(p_list)
-        unused_prompts_map[p] = p_list
+        if p_list:
+            unused_prompts_map[p] = p_list
  
     # prompts_map: Dict[str, str] = {} # No longer needed for final dump
     content_pool: List[str] = []
 
     def refill_pool():
         content_pool.clear()
-        # Only include paths that still have unused prompts
         valid_paths = [p for p in unused_prompts_map if unused_prompts_map[p]]
-        if not valid_paths:
-            raise RuntimeError("Run out of unique prompts for all content images!")
         content_pool.extend(valid_paths)
         rng.shuffle(content_pool)
  
-    def next_content_pair() -> Tuple[str, str]:
-        if not content_pool:
-            refill_pool()
-        
-        # Get a path from the pool
-        path = content_pool.pop()
-        
-        # Get the next unused prompt for this path
-        prompts_list = unused_prompts_map[path]
-        if not prompts_list:
-            # This path is exhausted, try next one in pool
-            return next_content_pair()
-            
-        prompt = prompts_list.pop()
-        return path, prompt
+    def next_content_pair() -> Optional[Tuple[str, str]]:
+        while True:
+            if not content_pool:
+                refill_pool()
+                if not content_pool:
+                    return None
+            path = content_pool.pop()
+            prompts_list = unused_prompts_map.get(path, [])
+            if not prompts_list:
+                continue
+            prompt = prompts_list.pop()
+            return path, prompt
 
     total = 0
     
-    prompts_path = join_path(out_dir, "prompts.json")
     prompts_file = mopen(prompts_path, "w", encoding="utf-8")
     prompts_file.write("{\n")
     is_first_prompt = True
+    if existing_prompts:
+        for k, v in existing_prompts.items():
+            if not is_first_prompt:
+                prompts_file.write(",\n")
+            else:
+                is_first_prompt = False
+            line = f'  "{k}": {json.dumps(v, ensure_ascii=False)}'
+            prompts_file.write(line)
+        prompts_file.flush()
 
     def write_pair(style_path: str) -> bool:
         nonlocal total, is_first_prompt
-        try:
-            content_path, base_prompt = next_content_pair()
-        except RuntimeError:
-            return False
+        blocked_content = set()
+        s_name = os.path.splitext(os.path.basename(style_path))[0]
+        while True:
+            pair = next_content_pair()
+            if pair is None:
+                return False
+            content_path, base_prompt = pair
+            c_name = os.path.splitext(os.path.basename(content_path))[0]
+            basename = f"{c_name}__{s_name}"
+            if basename in existing_keys:
+                unused_prompts_map[content_path].append(base_prompt)
+                blocked_content.add(c_name)
+                if len(blocked_content) >= len(unused_prompts_map):
+                    return True
+                continue
+            break
 
         # If use_style_prompt is enabled, append a random style instruction
         if args.use_style_prompt:
@@ -268,14 +349,26 @@ def main():
             prompts_file.write(line)
             prompts_file.flush()
             
+            existing_keys.add(basename)
             total += 1
         return True
 
-    bar = tqdm(total=args.num_combos, unit="pair") if tqdm else None
+    remaining = max(0, args.num_combos - len(existing_prompts))
+    if remaining == 0:
+        print(f"[DONE] total={len(existing_prompts)} -> {out_dir}")
+        prompts_file.write("\n}")
+        prompts_file.close()
+        return
+
+    available_content = len(unused_prompts_map)
+    available_prompts = sum(len(v) for v in unused_prompts_map.values())
+    print(f"[INFO] available_content={available_content} available_prompts={available_prompts} remaining={remaining}")
+
+    bar = tqdm(total=remaining, unit="pair") if tqdm else None
     stop_early = False
-    while total < args.num_combos and not stop_early:
+    while total < remaining and not stop_early:
         for sp in style_paths:
-            if total >= args.num_combos:
+            if total >= remaining:
                 break
             before = total
             if not write_pair(sp):
@@ -285,7 +378,7 @@ def main():
             if bar and total > before:
                 bar.update(total - before)
             elif (not bar) and total % 100 == 0 and total > 0:
-                print(f"[PROGRESS] {total}/{args.num_combos}")
+                print(f"[PROGRESS] {total}/{remaining}")
 
     if bar:
         bar.close()
@@ -293,7 +386,7 @@ def main():
     prompts_file.write("\n}")
     prompts_file.close()
 
-    print(f"[DONE] total={total} -> {out_dir}")
+    print(f"[DONE] total={len(existing_prompts) + total} -> {out_dir}")
 
 
 if __name__ == "__main__":

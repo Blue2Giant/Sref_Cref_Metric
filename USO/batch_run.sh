@@ -1,4 +1,5 @@
 sref_root=/mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content
+sref_root=/mnt/jfs/bench-bucket/sref_bench/sample_800_cref_sref_200_content
 python3 /data/benchmark_metrics/USO/batch_simple_demo.py \
   --input-dir $sref_root  \
   --prompts-json $sref_root/prompts.json \

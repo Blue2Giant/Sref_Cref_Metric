@@ -3,18 +3,30 @@
 
 import argparse
 import json
+import math
+import multiprocessing as mp
 import os
 import re
-import multiprocessing as mp
 from typing import Dict, Any, List, Tuple
+
 import torch
 from PIL import Image
 from tqdm import tqdm
-from transformers import AutoImageProcessor, AutoModel, AutoConfig
-from transformers import AutoProcessor, AutoTokenizer
-from transformers import CLIPProcessor, CLIPModel, CLIPImageProcessor, CLIPVisionModelWithProjection
-from transformers import AutoModelForCausalLM
-from csd_utils import CSDStyleEmbedding
+from transformers import (
+    AutoImageProcessor,
+    AutoModel,
+    AutoConfig,
+    AutoProcessor,
+    AutoTokenizer,
+    CLIPProcessor,
+    CLIPModel,
+    AutoModelForCausalLM,
+)
+
+from CSD.model import CSD_CLIP
+from CSD.utils import has_batchnorms, convert_state_dict
+from CSD.loss_utils import transforms_branch0
+from csd_utils import CSDStyleEmbedding, SEStyleEmbedding
 
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -150,32 +162,75 @@ def cas_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, dev
     return float(torch.mean((norm2 - norm1) ** 2).item())
 
 
-@torch.no_grad()
-def oneig_similarity(img_a: Image.Image, img_b: Image.Image, processor, model, device: str, dtype, sim_metric: str) -> float:
-    inputs_a = processor(images=img_a, return_tensors="pt").pixel_values.to(device, dtype=dtype)
-    inputs_b = processor(images=img_b, return_tensors="pt").pixel_values.to(device, dtype=dtype)
-    embeds_a = model(inputs_a).image_embeds
-    embeds_b = model(inputs_b).image_embeds
-    embeds_a = model()
-    return compute_similarity(embeds_a, embeds_b, sim_metric)
-
-
-def build_csd_encoder(model_path: str, device: str, clip_model_path: str):
+def build_oneig_encoder(csd_model_path: str, se_model_path: str, device: str, clip_model_path: str):
     clip_model_path = clip_model_path.strip() if clip_model_path else ""
     clip_model_path = clip_model_path or None
-    return CSDStyleEmbedding(model_path=model_path, device=device, clip_model_path=clip_model_path)
+    csd_encoder = CSDStyleEmbedding(model_path=csd_model_path, device=device, clip_model_path=clip_model_path)
+    se_encoder = SEStyleEmbedding(pretrained_path=se_model_path, device=device)
+    return csd_encoder, se_encoder
 
 
 @torch.no_grad()
-def csd_similarity(img_a: Image.Image, img_b: Image.Image, encoder, device: str, sim_metric: str, size: int) -> float:
+def oneig_similarity(img_a: Image.Image, img_b: Image.Image, encoder, device: str, sim_metric: str, size: int) -> float:
     if size:
         img_a = img_a.resize((size, size))
         img_b = img_b.resize((size, size))
-    embed_a = encoder.get_style_embedding(img_a)
-    embed_b = encoder.get_style_embedding(img_b)
-    vec_a = torch.tensor(embed_a, device=device).unsqueeze(0)
-    vec_b = torch.tensor(embed_b, device=device).unsqueeze(0)
-    return compute_similarity(vec_a, vec_b, sim_metric)
+    csd_encoder, se_encoder = encoder
+    csd_embed_a = csd_encoder.get_style_embedding(img_a)
+    csd_embed_b = csd_encoder.get_style_embedding(img_b)
+    se_embed_a = se_encoder.get_style_embedding(img_a)
+    se_embed_b = se_encoder.get_style_embedding(img_b)
+    csd_vec_a = torch.tensor(csd_embed_a, device=device).unsqueeze(0)
+    csd_vec_b = torch.tensor(csd_embed_b, device=device).unsqueeze(0)
+    se_vec_a = torch.tensor(se_embed_a, device=device).unsqueeze(0)
+    se_vec_b = torch.tensor(se_embed_b, device=device).unsqueeze(0)
+    csd_score = compute_similarity(csd_vec_a, csd_vec_b, "cosine")
+    se_score = compute_similarity(se_vec_a, se_vec_b, "cosine")
+    return (csd_score + se_score) / 2.0
+
+
+def _load_checkpoint(model_path: str):
+    try:
+        return torch.load(model_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(model_path, map_location="cpu")
+
+
+def build_csd_model(arch: str, model_path: str, device: str):
+    content_proj_head = "default"
+    model = CSD_CLIP(arch, content_proj_head)
+    if has_batchnorms(model):
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    ckpt = _load_checkpoint(model_path)
+    state_dict = convert_state_dict(ckpt["state_dict"])
+    model.load_state_dict(state_dict, strict=False)
+    model.eval().to(device)
+    preprocess = transforms_branch0
+    return model, preprocess
+
+
+@torch.no_grad()
+def csd_similarity(img_a: Image.Image, img_b: Image.Image, model, preprocess, device: str) -> float:
+    x_a = preprocess(img_a).unsqueeze(0).to(device)
+    x_b = preprocess(img_b).unsqueeze(0).to(device)
+    if hasattr(model, "encode_image"):
+        fa = model.encode_image(x_a)
+        fb = model.encode_image(x_b)
+    elif hasattr(model, "forward_image"):
+        fa = model.forward_image(x_a)
+        fb = model.forward_image(x_b)
+    else:
+        fa = model(x_a)
+        fb = model(x_b)
+    fa = fa[-1].clone() if isinstance(fa, (list, tuple)) else fa
+    fb = fb[-1].clone() if isinstance(fb, (list, tuple)) else fb
+    if fa.ndim > 2:
+        fa = fa.flatten(1)
+    if fb.ndim > 2:
+        fb = fb.flatten(1)
+    fa = torch.nn.functional.normalize(fa, dim=1)
+    fb = torch.nn.functional.normalize(fb, dim=1)
+    return compute_similarity(fa, fb, "cosine")
 
 
 @torch.no_grad()
@@ -228,13 +283,7 @@ def build_tasks_clipcap(image_dir: str, prompt_json: str) -> List[Tuple[str, str
 
 
 def build_tasks_clip_t(image_dir: str, prompt_json: str) -> List[Tuple[str, str, str]]:
-    with open(prompt_json, "r", encoding="utf-8") as f:
-        prompt_map = json.load(f)
-    if not isinstance(prompt_map, dict):
-        raise ValueError("prompt_json must be a dict")
-    image_map = list_images(image_dir)
-    keys = list(set(image_map.keys()) & set(prompt_map.keys()))
-    return [(k, image_map[k], str(prompt_map[k])) for k in keys]
+    return build_tasks_clipcap(image_dir, prompt_json)
 
 
 def build_tasks_onealign(image_dir: str) -> List[Tuple[str, str]]:
@@ -244,60 +293,7 @@ def build_tasks_onealign(image_dir: str) -> List[Tuple[str, str]]:
 
 
 def build_tasks_aesthetic(image_dir: str) -> List[Tuple[str, str]]:
-    image_map = list_images(image_dir)
-    keys = list(image_map.keys())
-    return [(k, image_map[k]) for k in keys]
-
-
-def _laion_head_dim(clip_model: str) -> int:
-    name = clip_model.lower().replace("_", "-")
-    if name in ["vit-l-14", "vit-l-14-336"]:
-        return 768
-    if name in ["vit-b-32", "vit-b-16"]:
-        return 512
-    raise ValueError(f"Unsupported clip_model for laion: {clip_model}")
-
-
-def load_laion_aesthetic(clip_model: str, clip_ckpt: str, pretrained_tag: str, linear_path: str, device: str):
-    import torch.nn as nn
-    from urllib.request import urlretrieve
-    import open_clip
-
-    linear_path = os.path.expanduser(linear_path)
-    if not os.path.isfile(linear_path):
-        os.makedirs(os.path.dirname(linear_path), exist_ok=True)
-        url_key = clip_model.lower().replace("-", "_")
-        url_model = (
-            "https://github.com/LAION-AI/aesthetic-predictor/blob/main/sa_0_4_"
-            + url_key
-            + "_linear.pth?raw=true"
-        )
-        urlretrieve(url_model, linear_path)
-    head_dim = _laion_head_dim(clip_model)
-    linear = nn.Linear(head_dim, 1)
-    state = torch.load(linear_path, map_location="cpu")
-    linear.load_state_dict(state)
-    linear.eval().to(device)
-    pretrained = clip_ckpt if clip_ckpt and os.path.isfile(clip_ckpt) else pretrained_tag
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        clip_model,
-        pretrained=pretrained,
-        device=device,
-    )
-    model.eval()
-    return model, preprocess, linear
-
-
-def load_aesthetic_v25(encoder_model_name: str, device: str, dtype):
-    from aesthetic_predictor_v2_5 import convert_v2_5_from_siglip
-
-    model, preprocessor = convert_v2_5_from_siglip(
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-        encoder_model_name=encoder_model_name,
-    )
-    model = model.to(dtype).to(device)
-    return model, preprocessor
+    return build_tasks_onealign(image_dir)
 
 
 def _setup_cuda_env(args_dict: dict):
@@ -334,24 +330,26 @@ def worker_pair(encoder: str, args_dict: dict, tasks: List[Tuple[str, str, str]]
             out_queue.put((k, score))
         return
     if encoder == "oneig":
-        processor = CLIPImageProcessor()
-        model = CLIPVisionModelWithProjection.from_pretrained(args_dict["model"]).to(device, dtype=args_dict["dtype"])
-        model.eval()
+        encoder = build_oneig_encoder(
+            args_dict["model_path"],
+            args_dict["se_model_path"],
+            device,
+            args_dict["clip_model_path"],
+        )
         sim_metric = args_dict["sim_metric"]
+        size = args_dict.get("oneig_size", 512)
         for k, p1, p2 in tasks:
             img_a = read_image(p1)
             img_b = read_image(p2)
-            score = oneig_similarity(img_a, img_b, processor, model, device, args_dict["dtype"], sim_metric)
+            score = oneig_similarity(img_a, img_b, encoder, device, sim_metric, size)
             out_queue.put((k, score))
         return
     if encoder == "csd":
-        encoder = build_csd_encoder(args_dict["model_path"], device, args_dict["clip_model_path"])
-        sim_metric = args_dict["sim_metric"]
-        size = args_dict.get("csd_size", 512)
+        model, preprocess = build_csd_model(args_dict["arch"], args_dict["model_path"], device)
         for k, p1, p2 in tasks:
             img_a = read_image(p1)
             img_b = read_image(p2)
-            score = csd_similarity(img_a, img_b, encoder, device, sim_metric, size)
+            score = csd_similarity(img_a, img_b, model, preprocess, device)
             out_queue.put((k, score))
         return
     raise ValueError(f"Unsupported encoder: {encoder}")
@@ -407,6 +405,57 @@ def worker_onealign(args_dict: dict, tasks: List[Tuple[str, str]], out_queue: mp
         out_queue.put((k, float(score)))
 
 
+def _laion_head_dim(clip_model: str) -> int:
+    name = clip_model.lower().replace("_", "-")
+    if name in ["vit-l-14", "vit-l-14-336"]:
+        return 768
+    if name in ["vit-b-32", "vit-b-16"]:
+        return 512
+    raise ValueError(f"Unsupported clip_model for laion: {clip_model}")
+
+
+def load_laion_aesthetic(clip_model: str, clip_ckpt: str, pretrained_tag: str, linear_path: str, device: str):
+    import torch.nn as nn
+    from urllib.request import urlretrieve
+    import open_clip
+
+    linear_path = os.path.expanduser(linear_path)
+    if not os.path.isfile(linear_path):
+        os.makedirs(os.path.dirname(linear_path), exist_ok=True)
+        url_key = clip_model.lower().replace("-", "_")
+        url_model = (
+            "https://github.com/LAION-AI/aesthetic-predictor/blob/main/sa_0_4_"
+            + url_key
+            + "_linear.pth?raw=true"
+        )
+        urlretrieve(url_model, linear_path)
+    head_dim = _laion_head_dim(clip_model)
+    linear = nn.Linear(head_dim, 1)
+    state = torch.load(linear_path, map_location="cpu")
+    linear.load_state_dict(state)
+    linear.eval().to(device)
+    pretrained = clip_ckpt if clip_ckpt and os.path.isfile(clip_ckpt) else pretrained_tag
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        clip_model,
+        pretrained=pretrained,
+        device=device,
+    )
+    model.eval()
+    return model, preprocess, linear
+
+
+def load_aesthetic_v25(encoder_model_name: str, device: str, dtype):
+    from aesthetic_predictor_v2_5 import convert_v2_5_from_siglip
+
+    model, preprocessor = convert_v2_5_from_siglip(
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+        encoder_model_name=encoder_model_name,
+    )
+    model = model.to(dtype).to(device)
+    return model, preprocessor
+
+
 def worker_aesthetic(args_dict: dict, tasks: List[Tuple[str, str]], out_queue: mp.Queue):
     _setup_cuda_env(args_dict)
     device = args_dict["device"]
@@ -430,61 +479,61 @@ def worker_aesthetic(args_dict: dict, tasks: List[Tuple[str, str]], out_queue: m
             out_queue.put((k, float(score)))
         return
     if backend == "v25":
-        dtype = args_dict["dtype"]
-        model, preprocessor = load_aesthetic_v25(
+        model, preprocess = load_aesthetic_v25(
             args_dict["v25_encoder_model_name"],
             device,
-            dtype,
+            args_dict["dtype"],
         )
+        model.eval()
         for k, img_path in tasks:
             img = read_image(img_path)
-            pixel_values = preprocessor(images=img, return_tensors="pt").pixel_values.to(dtype).to(device)
-            score = model(pixel_values).logits.squeeze()
+            x = preprocess(img).unsqueeze(0).to(device, dtype=args_dict["dtype"])
+            score = model(x)
             if hasattr(score, "item"):
                 score = score.item()
             out_queue.put((k, float(score)))
         return
-    raise ValueError(f"Unsupported aesthetic backend: {backend}")
+    raise ValueError(f"Unsupported backend: {backend}")
 
 
-def parse_gpus(gpu_str: str) -> List[int]:
-    if not gpu_str:
-        return []
-    items = []
-    for part in gpu_str.split(","):
-        part = part.strip()
-        if part == "":
+def run_batch(tasks: List[Tuple], out_path: str, overwrite: bool, worker_fn, args_dict: dict):
+    results = load_json(out_path)
+    if overwrite:
+        results = {}
+    remaining = []
+    for item in tasks:
+        key = item[0]
+        if key in results:
             continue
-        items.append(int(part))
-    return items
-
-
-def run_batch(tasks, out_path: str, overwrite: bool, worker_fn, args_dict):
-    results = {}
-    if (not overwrite) and os.path.isfile(out_path):
-        results = load_json(out_path)
-        tasks = [t for t in tasks if t[0] not in results]
-    if not tasks:
+        remaining.append(item)
+    if not remaining:
         save_json(out_path, results)
         return
-    gpus = parse_gpus(args_dict.get("gpus", ""))
-    num_procs = max(1, len(gpus)) if gpus else max(1, int(args_dict["num_procs"]))
-    chunk_size = (len(tasks) + num_procs - 1) // num_procs
+    gpus = str(args_dict.get("gpus") or "").strip()
+    gpus = [x for x in gpus.split(",") if x != ""]
+    num_procs = max(1, int(args_dict.get("num_procs") or 1))
+    if gpus:
+        num_procs = min(num_procs, len(gpus))
+    num_procs = min(num_procs, len(remaining))
+    chunk = int(math.ceil(len(remaining) / float(num_procs)))
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     workers = []
     for i in range(num_procs):
-        sub = tasks[i * chunk_size : (i + 1) * chunk_size]
+        sub = remaining[i * chunk:(i + 1) * chunk]
         if not sub:
             continue
         sub_args = dict(args_dict)
         if gpus:
             sub_args["cuda_visible_devices"] = str(gpus[i % len(gpus)])
             sub_args["device"] = "cuda:0"
-        p = ctx.Process(target=worker_fn, args=(sub_args.get("encoder"), sub_args, sub, q)) if sub_args.get("encoder") else ctx.Process(target=worker_fn, args=(sub_args, sub, q))
+        if sub_args.get("encoder"):
+            p = ctx.Process(target=worker_fn, args=(sub_args.get("encoder"), sub_args, sub, q))
+        else:
+            p = ctx.Process(target=worker_fn, args=(sub_args, sub, q))
         p.start()
         workers.append(p)
-    total = len(tasks)
+    total = len(remaining)
     done = 0
     pbar = tqdm(total=total, unit="img")
     while done < total:
@@ -519,10 +568,13 @@ def main():
     ap_pair.add_argument("--gpus", default="")
     ap_pair.add_argument("--overwrite", type=parse_overwrite, default=False)
     ap_pair.add_argument("--sim_metric", choices=["cosine", "cosine01", "l2", "dot"], default="cosine01")
+    ap_pair.add_argument("--oneig_arch", default="vit_base")
+    ap_pair.add_argument("--oneig_model_path", default="")
+    ap_pair.add_argument("--oneig_se_model_path", default="")
+    ap_pair.add_argument("--oneig_clip_model_path", default="")
+    ap_pair.add_argument("--oneig_size", type=int, default=512)
     ap_pair.add_argument("--csd_arch", default="vit_base")
     ap_pair.add_argument("--csd_model_path", default="")
-    ap_pair.add_argument("--csd_clip_model_path", default="")
-    ap_pair.add_argument("--csd_size", type=int, default=512)
 
     ap_clip = sub.add_parser("clip_cap")
     ap_clip.add_argument("--image_dir", required=True)
@@ -557,6 +609,7 @@ def main():
     ap_one.add_argument("--num_procs", type=int, default=4)
     ap_one.add_argument("--gpus", default="")
     ap_one.add_argument("--overwrite", type=parse_overwrite, default=False)
+
     ap_aes = sub.add_parser("aesthetic")
     ap_aes.add_argument("--backend", choices=["laion", "v25"], required=True)
     ap_aes.add_argument("--image_dir", required=True)
@@ -586,13 +639,21 @@ def main():
             "num_procs": args.num_procs,
             "gpus": args.gpus,
             "sim_metric": args.sim_metric,
-            "arch": args.csd_arch,
-            "model_path": args.csd_model_path,
-            "clip_model_path": args.csd_clip_model_path,
-            "csd_size": args.csd_size,
+            "arch": args.oneig_arch,
+            "model_path": args.oneig_model_path,
+            "clip_model_path": args.oneig_clip_model_path,
+            "se_model_path": args.oneig_se_model_path,
+            "oneig_size": args.oneig_size,
         }
-        if args.encoder == "csd" and not args.csd_model_path:
-            raise SystemExit("--csd_model_path is required when encoder=csd")
+        if args.encoder == "oneig" and not args.oneig_model_path:
+            raise SystemExit("--oneig_model_path is required when encoder=oneig")
+        if args.encoder == "oneig" and not args.oneig_se_model_path:
+            raise SystemExit("--oneig_se_model_path is required when encoder=oneig")
+        if args.encoder == "csd":
+            args_dict["arch"] = args.csd_arch
+            args_dict["model_path"] = args.csd_model_path
+            if not args.csd_model_path:
+                raise SystemExit("--csd_model_path is required when encoder=csd")
         run_batch(tasks, args.out_json, args.overwrite, worker_pair, args_dict)
         return
 

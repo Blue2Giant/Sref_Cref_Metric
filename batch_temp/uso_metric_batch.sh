@@ -31,9 +31,9 @@ OUT_LAION_JSON="$RESULT_DIR/laion_scores.json"
 OUT_V25_AESTHETIC="$RESULT_DIR/v25_scores.json"
 overwrite=0
 # 风格一致性
-echo "==== CSD ===="
+echo "==== oneig ===="
 python3 "$RUNNER_PY" pair \
-  --encoder csd \
+  --encoder oneig \
   --dir_a "$STYLE_DIR" \
   --dir_b "$RESULT_DIR" \
   --out_json "$OUT_CSD_JSON" \

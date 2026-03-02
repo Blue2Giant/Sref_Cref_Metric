@@ -13,7 +13,9 @@ SREF_ROOT="/mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen
 DINOV2_MODEL="/mnt/jfs/model_zoo/dinov2-with-registers-large"
 CAS_MODEL="/mnt/jfs/model_zoo/dinov2-base"
 ONEIG_MODEL="/mnt/jfs/model_zoo/OneIG-StyleEncoder"
-CSD_MODEL="/data/Sref_Cref/CSD/pretrainedmodels/vit-b-300ep.pth.tar"
+CSD_MODEL="/mnt/jfs/model_zoo/OneIG-StyleEncoder/csd.pth"
+CSD_MODEL_ONLY="/mnt/jfs/model_zoo/OneIG-StyleEncoder/vit-b-300ep.pth.tar"
+VIT_L="/mnt/jfs/model_zoo/OneIG-StyleEncoder/ViT-L-14.pt"
 CLIPCAP_MODEL="/mnt/jfs/model_zoo/clip-vit-large-patch14"
 ONEALIGN_MODEL="/mnt/jfs/model_zoo/one-align"
 ONEALIGN_TASK="aesthetics"
@@ -29,42 +31,32 @@ OUT_LAION_JSON="$SREF_ROOT/laion_scores.json"
 OUT_V25_AESTHETIC="$SREF_ROOT/v25_scores.json"
 overwrite=1
 #风格一致性
-echo "=== csd new ==="
+
+echo "==== CSD ===="
 python3 "$RUNNER_PY" pair \
   --encoder csd \
   --dir_a "$STYLE_DIR" \
   --dir_b "$RESULT_DIR" \
   --out_json "$OUT_CSD_JSON" \
   --model dummy \
-  --csd_model_path /data/benchmark_metrics/logs/csd.pth \
-  --csd_clip_model_path /data/benchmark_metrics/logs/ViT-L-14.pt \
-  --csd_size 512 \
-  --sim_metric cosine \
+  --csd_arch vit_base \
+  --csd_model_path $CSD_MODEL_ONLY \
+  --device cuda \
+  --gpus "$GPUS" \
   --overwrite $overwrite
-# echo "==== CSD ===="
-# python3 "$RUNNER_PY" pair \
-#   --encoder csd \
-#   --dir_a "$STYLE_DIR" \
-#   --dir_b "$RESULT_DIR" \
-#   --out_json "$OUT_CSD_JSON" \
-#   --model dummy \
-#   --csd_arch vit_base \
-#   --csd_model_path $CSD_MODEL \
-#   --device cuda \
-#   --gpus "$GPUS" \
-#   --overwrite $overwrite \
-#     --sim_metric l2
 
-# echo "=== oneig ===="
-# python3 "$RUNNER_PY" pair \
-#   --encoder oneig \
-#   --dir_a "$STYLE_DIR" \
-#   --dir_b "$RESULT_DIR" \
-#   --model "$ONEIG_MODEL" \
-#   --out_json "$OUT_ONEIG_JSON" \
-#   --gpus "$GPUS" \
-#   --overwrite $overwrite \
-#   --sim_metric l2
+echo "=== oneig ===="
+python3 "$RUNNER_PY" pair \
+  --encoder oneig \
+  --dir_a "$STYLE_DIR" \
+  --dir_b "$RESULT_DIR" \
+  --model dummy \
+  --oneig_model_path "$CSD_MODEL" \
+  --oneig_se_model_path "$ONEIG_MODEL" \
+  --oneig_clip_model_path "$VIT_L" \
+  --out_json "$OUT_ONEIG_JSON" \
+  --gpus "$GPUS" \
+  --overwrite $overwrite
 
 # #内容一致性
 # echo "=== dinov2 ===="
@@ -97,15 +89,15 @@ python3 "$RUNNER_PY" pair \
 #   --clipcap_text_mode first_sentence \
 #   --overwrite $overwrite
 
-echo "=== clip-t ==="
-python3 "$RUNNER_PY" clip_t \
-  --image_dir "$RESULT_DIR" \
-  --prompt_json "$SREF_PROMPT" \
-  --out_json "$OUT_CLIPCAP_JSON" \
-  --model /mnt/jfs/model_zoo/openai/clip-vit-base-patch32 \
-  --sim_metric cosine \
-  --clipcap_text_mode first_sentence \
-  --overwrite $overwrite
+# echo "=== clip-t ==="
+# python3 "$RUNNER_PY" clip_t \
+#   --image_dir "$RESULT_DIR" \
+#   --prompt_json "$SREF_PROMPT" \
+#   --out_json "$OUT_CLIPCAP_JSON" \
+#   --model /mnt/jfs/model_zoo/openai/clip-vit-base-patch32 \
+#   --sim_metric cosine \
+#   --clipcap_text_mode first_sentence \
+#   --overwrite $overwrite
 
 #美学评分
 # echo "=== laion aesthetic ==="

@@ -48,7 +48,12 @@ python /data/benchmark_metrics/concat2seeMetric.py \
   --out_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/vis_content_vlm \
   --long_side 512 \
     --caption_json /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/qwen-edit/qwen_resize_output_content_reason_descrete.json
-
+拒绝采样指标：
+python /data/benchmark_metrics/concat2seeMetric.py \
+  --folders /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/cref /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/sref /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/qwen-edit \
+  --jsons /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/qwen-edit/qwen_reject_cref.json  /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/qwen-edit/qwen_reject_sref.json\
+  --out_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_bench_cref_sref_ture/dual_judeg_vlm \
+  --long_side 512 \
 
 """
 import argparse

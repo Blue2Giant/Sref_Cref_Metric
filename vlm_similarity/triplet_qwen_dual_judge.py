@@ -130,14 +130,6 @@ def join_path(base: str, name: str) -> str:
     return base + name if base.endswith("/") else base + "/" + name
 
 
-def sort_key(name: str):
-    base = os.path.splitext(os.path.basename(name))[0]
-    nums = re.findall(r"\d+", base)
-    if nums:
-        return int(nums[0])
-    return base
-
-
 def _read_bytes(path: str) -> Optional[bytes]:
     try:
         if path.startswith("s3://") or path.startswith("oss://"):
@@ -577,14 +569,13 @@ def main():
     content_files = set(smart_listdir(args.content_dir))
     style_files = set(smart_listdir(args.style_dir))
     result_files = set(smart_listdir(args.result_dir))
-    common_files = sorted(list(content_files & style_files & result_files), key=sort_key)
+    common_files = list(content_files & style_files & result_files)
     common_files = [f for f in common_files if is_image_name(f)]
 
     if args.num_samples > 0 and len(common_files) > args.num_samples:
         import random
         random.seed(args.seed)
         common_files = random.sample(common_files, args.num_samples)
-        common_files = sorted(common_files, key=sort_key)
 
     log(f"Found {len(common_files)} common images to process.")
 
@@ -598,7 +589,6 @@ def main():
             style_results = tmp_s
             processed_keys = set(tmp_c.keys()) & set(tmp_s.keys())
             common_files = [f for f in common_files if os.path.splitext(f)[0] not in processed_keys]
-            common_files = sorted(common_files, key=sort_key)
             log(f"[Resume] {len(common_files)} remaining to process.")
 
     if not common_files:
@@ -640,14 +630,8 @@ def main():
                 total_done += 1
                 pbar.update(1)
                 if total_done % 50 == 0:
-                    smart_write_json(
-                        args.output_content_json,
-                        dict(sorted(content_results.items(), key=lambda x: sort_key(x[0]))),
-                    )
-                    smart_write_json(
-                        args.output_style_json,
-                        dict(sorted(style_results.items(), key=lambda x: sort_key(x[0]))),
-                    )
+                    smart_write_json(args.output_content_json, content_results)
+                    smart_write_json(args.output_style_json, style_results)
             except Exception:
                 if not any(p.is_alive() for p in workers) and result_queue.empty():
                     break
@@ -655,14 +639,8 @@ def main():
     for p in workers:
         p.join()
 
-    smart_write_json(
-        args.output_content_json,
-        dict(sorted(content_results.items(), key=lambda x: sort_key(x[0]))),
-    )
-    smart_write_json(
-        args.output_style_json,
-        dict(sorted(style_results.items(), key=lambda x: sort_key(x[0]))),
-    )
+    smart_write_json(args.output_content_json, content_results)
+    smart_write_json(args.output_style_json, style_results)
     log(f"Done. Results saved to {args.output_content_json} and {args.output_style_json}")
 
 

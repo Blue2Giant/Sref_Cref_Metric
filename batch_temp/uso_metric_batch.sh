@@ -15,7 +15,9 @@ SREF_PROMPT="$SREF_ROOT/prompts.json"
 DINOV2_MODEL="/mnt/jfs/model_zoo/dinov2-with-registers-large"
 CAS_MODEL="/mnt/jfs/model_zoo/dinov2-base"
 ONEIG_MODEL="/mnt/jfs/model_zoo/OneIG-StyleEncoder"
-CSD_MODEL="/data/Sref_Cref/CSD/pretrainedmodels/vit-b-300ep.pth.tar"
+CSD_MODEL="/mnt/jfs/model_zoo/OneIG-StyleEncoder/csd.pth"
+CSD_MODEL_ONLY="/mnt/jfs/model_zoo/OneIG-StyleEncoder/vit-b-300ep.pth.tar"
+VIT_L="/mnt/jfs/model_zoo/OneIG-StyleEncoder/ViT-L-14.pt"
 CLIPCAP_MODEL="/mnt/jfs/model_zoo/clip-vit-large-patch14"
 ONEALIGN_MODEL="/mnt/jfs/model_zoo/one-align"
 ONEALIGN_TASK="aesthetics"
@@ -29,19 +31,20 @@ OUT_ONEALIGN_JSON="$RESULT_DIR/onealign_out.json"
 OUT_CSD_JSON="$RESULT_DIR/csd_out.json"
 OUT_LAION_JSON="$RESULT_DIR/laion_scores.json"
 OUT_V25_AESTHETIC="$RESULT_DIR/v25_scores.json"
-overwrite=0
+overwrite=1
+num_procs=64
 # 风格一致性
-echo "==== oneig ===="
+echo "==== CSD ===="
 python3 "$RUNNER_PY" pair \
-  --encoder oneig \
+  --encoder csd \
   --dir_a "$STYLE_DIR" \
   --dir_b "$RESULT_DIR" \
   --out_json "$OUT_CSD_JSON" \
   --model dummy \
-  --csd_model_path /data/benchmark_metrics/logs/csd.pth \
-  --csd_clip_model_path /data/benchmark_metrics/logs/ViT-L-14.pt \
-  --csd_size 512 \
-  --sim_metric cosine \
+  --csd_arch vit_base \
+  --csd_model_path $CSD_MODEL_ONLY \
+  --device cuda \
+  --gpus "$GPUS" \
   --overwrite $overwrite
 
 echo "=== oneig ===="
@@ -49,7 +52,10 @@ python3 "$RUNNER_PY" pair \
   --encoder oneig \
   --dir_a "$STYLE_DIR" \
   --dir_b "$RESULT_DIR" \
-  --model "$ONEIG_MODEL" \
+  --model dummy \
+  --oneig_model_path "$CSD_MODEL" \
+  --oneig_se_model_path "$ONEIG_MODEL" \
+  --oneig_clip_model_path "$VIT_L" \
   --out_json "$OUT_ONEIG_JSON" \
   --gpus "$GPUS" \
   --overwrite $overwrite
@@ -74,13 +80,13 @@ python3 "$RUNNER_PY" pair \
   --overwrite $overwrite
 
 #指令遵循
-echo "=== clip cap ==="
-python3 "$RUNNER_PY" clip_cap \
+echo "=== clip t ==="
+python3 "$RUNNER_PY" clip_t \
   --image_dir "$RESULT_DIR" \
   --prompt_json "$SREF_PROMPT" \
   --out_json "$OUT_CLIPCAP_JSON" \
-  --model "$CLIPCAP_MODEL" \
-  --gpus "$GPUS" \
+  --model /mnt/jfs/model_zoo/openai/clip-vit-base-patch32 \
+  --sim_metric cosine \
   --clipcap_text_mode first_sentence \
   --overwrite $overwrite
 
@@ -122,7 +128,7 @@ python3 /data/benchmark_metrics/vlm_similarity/style_similarity_dir.py \
   --out_reason_json $reason_json_style_discrete \
   --base_url $xingpeng_ip \
   --model $xingpeng_model \
-  --num_procs 32 \
+  --num_procs $num_procs \
   --overwrite
 
 echo "====vlm content===="
@@ -139,7 +145,7 @@ python3 /data/benchmark_metrics/vlm_similarity/content_similarity_dir.py \
   --out_reason_json $reason_json_content_discrete \
   --base_url $xingpeng_ip \
   --model $xingpeng_model \
-  --num_procs 64 \
+  --num_procs $num_procs \
   --overwrite
 
 echo "=== vlm insturction follow ==="
@@ -155,7 +161,7 @@ python3 /data/benchmark_metrics/vlm_similarity/edit_instruction_follow_dir.py \
   --base_url $xingpeng_ip \
   --model $xingpeng_model \
   --instruction_text_mode first_sentence \
-  --num_procs 32 \
+  --num_procs $num_procs \
   --overwrite
 
 echo "=== triplet qwen dual judge ==="
@@ -171,6 +177,6 @@ python3 /data/benchmark_metrics/vlm_similarity/triplet_qwen_dual_judge.py \
     --output_content_json $output_json_content \
     --output_style_json $output_json_style \
     --endpoint "qwen3vlw8a8@http://stepcloud-apisix-gateway-eval.i-stepfun.com/Qwen3-VL-235B-A22B-W8A8/v1" \
-    --procs_per_endpoint 32 \
+    --procs_per_endpoint $num_procs \
     --overwrite
     

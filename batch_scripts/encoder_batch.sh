@@ -32,31 +32,31 @@ OUT_V25_AESTHETIC="$SREF_ROOT/v25_scores.json"
 overwrite=1
 #风格一致性
 
-echo "==== CSD ===="
-python3 "$RUNNER_PY" pair \
-  --encoder csd \
-  --dir_a "$STYLE_DIR" \
-  --dir_b "$RESULT_DIR" \
-  --out_json "$OUT_CSD_JSON" \
-  --model dummy \
-  --csd_arch vit_base \
-  --csd_model_path $CSD_MODEL_ONLY \
-  --device cuda \
-  --gpus "$GPUS" \
-  --overwrite $overwrite
+# echo "==== CSD ===="
+# python3 "$RUNNER_PY" pair \
+#   --encoder csd \
+#   --dir_a "$STYLE_DIR" \
+#   --dir_b "$RESULT_DIR" \
+#   --out_json "$OUT_CSD_JSON" \
+#   --model dummy \
+#   --csd_arch vit_base \
+#   --csd_model_path $CSD_MODEL_ONLY \
+#   --device cuda \
+#   --gpus "$GPUS" \
+#   --overwrite $overwrite
 
-echo "=== oneig ===="
-python3 "$RUNNER_PY" pair \
-  --encoder oneig \
-  --dir_a "$STYLE_DIR" \
-  --dir_b "$RESULT_DIR" \
-  --model dummy \
-  --oneig_model_path "$CSD_MODEL" \
-  --oneig_se_model_path "$ONEIG_MODEL" \
-  --oneig_clip_model_path "$VIT_L" \
-  --out_json "$OUT_ONEIG_JSON" \
-  --gpus "$GPUS" \
-  --overwrite $overwrite
+# echo "=== oneig ===="
+# python3 "$RUNNER_PY" pair \
+#   --encoder oneig \
+#   --dir_a "$STYLE_DIR" \
+#   --dir_b "$RESULT_DIR" \
+#   --model dummy \
+#   --oneig_model_path "$CSD_MODEL" \
+#   --oneig_se_model_path "$ONEIG_MODEL" \
+#   --oneig_clip_model_path "$VIT_L" \
+#   --out_json "$OUT_ONEIG_JSON" \
+#   --gpus "$GPUS" \
+#   --overwrite $overwrite
 
 # #内容一致性
 # echo "=== dinov2 ===="
@@ -112,13 +112,13 @@ python3 "$RUNNER_PY" pair \
 #   --gpus 0 \
 #   --overwrite $overwrite
 
-# echo "==== aesthetic v25 ===="
-# python /data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py aesthetic \
-#   --backend v25 \
-#   --image_dir $RESULT_DIR \
-#   --out_json $OUT_V25_AESTHETIC \
-#   --v25_encoder_model_name /mnt/jfs/model_zoo/siglip-so400m-patch14-384/ \
-#   --dtype bfloat16 \
-#   --device cuda \
-#   --gpus 0 \
-#   --overwrite $overwrite
+echo "==== aesthetic v25 ===="
+python /data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py aesthetic \
+  --backend v25 \
+  --image_dir $RESULT_DIR \
+  --out_json $OUT_V25_AESTHETIC \
+  --v25_encoder_model_name /mnt/jfs/model_zoo/siglip-so400m-patch14-384/ \
+  --dtype bfloat16 \
+  --device cuda \
+  --gpus 0 \
+  --overwrite $overwrite

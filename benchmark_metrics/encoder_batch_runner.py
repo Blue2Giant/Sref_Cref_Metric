@@ -487,11 +487,12 @@ def worker_aesthetic(args_dict: dict, tasks: List[Tuple[str, str]], out_queue: m
         model.eval()
         for k, img_path in tasks:
             img = read_image(img_path)
-            x = preprocess(img).unsqueeze(0).to(device, dtype=args_dict["dtype"])
-            score = model(x)
-            if hasattr(score, "item"):
-                score = score.item()
-            out_queue.put((k, float(score)))
+            inputs = preprocess(images=img, return_tensors="pt")
+            pixel_values = inputs.pixel_values.to(device, dtype=args_dict["dtype"])
+            with torch.inference_mode():
+                outputs = model(pixel_values)
+                score = outputs.logits.squeeze().float()
+            out_queue.put((k, float(score.item())))
         return
     raise ValueError(f"Unsupported backend: {backend}")
 

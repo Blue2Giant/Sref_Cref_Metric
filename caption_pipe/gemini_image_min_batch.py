@@ -24,6 +24,10 @@ from PIL import Image
 from tqdm import tqdm
 
 
+banana_aspect_ratio = ["1:1","1:4","1:8","2:3","3:2","3:4","4:1","4:3","4:5","5:4","8:1","9:16","16:9","21:9"]
+banana_resolution = ["512px", "1K", "2K", "4K"]
+
+
 def image_to_part(path: str) -> types.Part:
     img = Image.open(path).convert("RGB")
     buf = BytesIO()
@@ -44,6 +48,25 @@ def build_client(base_url: str, api_version: str):
         http_options={"api_version": api_version, "base_url": base_url},
         api_key=os.getenv("GEMINI_API_KEY", ""),
     )
+
+
+def _parse_ratio(ratio: str) -> float:
+    left, right = ratio.split(":", 1)
+    return float(left) / float(right)
+
+
+def _select_aspect_ratio(width: int, height: int) -> str:
+    target = width / float(height)
+    best = None
+    best_diff = None
+    for r in banana_aspect_ratio:
+        value = _parse_ratio(r)
+        diff = abs(value - target)
+        if best is None or diff < best_diff:
+            best = r
+            best_diff = diff
+    return best
+
 
 
 def save_first_image(resp, out_path: Path) -> bool:
@@ -76,13 +99,31 @@ def _worker(rank: int, tasks: List[Tuple[str, str]], args, result_queue: mp.Queu
             if not cref_path.exists() or not sref_path.exists():
                 result_queue.put(("missing", k, None))
                 continue
+            content_image = Image.open(cref_path).convert("RGB")
+            if args.aspect_ratio:
+                if args.aspect_ratio not in banana_aspect_ratio:
+                    raise ValueError(f"aspect_ratio {args.aspect_ratio} not in {banana_aspect_ratio}")
+                aspect_ratio = args.aspect_ratio
+            else:
+                aspect_ratio = _select_aspect_ratio(content_image.width, content_image.height)
+            if args.resolution not in banana_resolution:
+                raise ValueError(f"resolution {args.resolution} not in {banana_resolution}")
+            image_size = args.resolution
+            assert args.resolution in banana_resolution, f"resolution {args.resolution} not in {banana_resolution}"
+            image_size = args.resolution
             content_part = image_to_part(str(cref_path))
             style_part = image_to_part(str(sref_path))
             text_part = types.Part.from_text(text=prompt)
             resp = client.models.generate_content(
                 model=args.model_id,
                 contents=[content_part, style_part, text_part],
-                config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE"],
+                    image_config=types.ImageConfig(
+                        aspect_ratio=aspect_ratio,
+                        image_size=image_size,
+                    ),
+                ),
             )
             if not save_first_image(resp, out_path):
                 result_queue.put(("error", k, "no_image"))
@@ -116,6 +157,8 @@ def parse_args():
     p.add_argument("--base_url", default="https://models-proxy.stepfun-inc.com/gemini")
     p.add_argument("--api_version", default="v1alpha")
     p.add_argument("--num_procs", type=int, default=4)
+    p.add_argument("--resolution", default="1K", help="Image resolution.")
+    p.add_argument("--aspect_ratio", default="", help="Image aspect ratio.")
     p.add_argument("--num_generate", type=int, default=0, help="Generate first N items only. 0 = all.")
     p.add_argument("--limit", type=int, default=0, help="Run first N items only. 0 = all.")
     p.add_argument("--ids", type=str, default="", help='Comma-separated ids to run, e.g. "000015,000010".')

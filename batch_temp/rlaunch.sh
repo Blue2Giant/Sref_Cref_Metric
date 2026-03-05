@@ -2,7 +2,7 @@
 
 DEFAULT_GROUPS=("l40s_yangtong" "buffer" "maintain")
 DEFAULT_GROUP="buffer"
-DEFAULT_GPU=0
+DEFAULT_GPU=8
 DEFAULT_CPU=64
 DEFAULT_MEMORY=1000000
 
@@ -53,12 +53,10 @@ echo "Memory (MB)   : $MEMORY"
 while true; do
     brainctl launch --charged-group="$GROUP" --private-machine=yes \
         --cpu="$CPU" --gpu="$GPU" --memory="$MEMORY" --positive-tags "H100,H800" \
+        --negative-tags gpu-h100-0290.host.platform.shaipower.com \
+        --negative-tags gpu-h100-0452.host.platform.shaipower.com \
         --mount=juicefs+s3://oss.i.shaipower.com/lanjinghong-data:/mnt/jfs \
-        --mount=juicefs+s3://oss.i.shaipower.com/comfyui:/mnt/comfyui \
-        --mount=juicefs+s3://oss.i.shaipower.com/marmot:/mnt/marmot \
-        --mount=juicefs+s3://oss.i.shaipower.com/chengwei-jfs:/mnt/chengwei \
         --i-know-i-am-wasting-resource=false \
-        --preemptible=yes \
         --custom-resources rdma/mlnx_shared=8 --entrypoint="" -- bash   
     echo "rlaunch 任务已退出，3秒后重试..."
     sleep 3

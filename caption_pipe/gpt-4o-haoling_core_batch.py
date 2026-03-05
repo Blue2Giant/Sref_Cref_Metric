@@ -121,10 +121,16 @@ def _worker(rank: int, tasks: List[Tuple[str, str]], args, result_queue: mp.Queu
                 timeout=args.timeout,
             )
             resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+            try:
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+            except Exception as e:
+                print(f"[{k}] response parse failed: {e}")
+                result_queue.put(("error", k, f"parse_failed:{e}"))
+                continue
             urls = extract_image_urls(content)
             if not urls:
+                print(f"[{k}] no image url in response")
                 result_queue.put(("error", k, "no_image"))
                 continue
             image = download_image(urls[0])
@@ -143,6 +149,7 @@ def _worker(rank: int, tasks: List[Tuple[str, str]], args, result_queue: mp.Queu
                 meta_f.flush()
             result_queue.put(("done", k, None))
         except Exception as e:
+            print(f"[{k}] request failed: {e}")
             result_queue.put(("error", k, str(e)))
     if meta_f is not None:
         meta_f.close()

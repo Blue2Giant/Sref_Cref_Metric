@@ -75,6 +75,7 @@ def save_first_image(resp, out_path: Path) -> bool:
             img = part.as_image()
             out_path.parent.mkdir(parents=True, exist_ok=True)
             img.save(out_path)
+            print(f"[SAVE] {out_path} size={img.size}")
             return True
     return False
 

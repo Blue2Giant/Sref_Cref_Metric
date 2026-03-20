@@ -43,6 +43,7 @@ class ComfyKit:
         executor_type: Literal["http", "websocket"] = "http",
         api_key: Optional[str] = None,
         cookies: Optional[str] = None,
+        session_pool_size: int = 1,
         # RunningHub configuration (cloud execution)
         runninghub_url: Optional[str] = None,
         runninghub_api_key: Optional[str] = None,
@@ -133,6 +134,7 @@ class ComfyKit:
         self.executor_type = executor_type or os.getenv("COMFYUI_EXECUTOR_TYPE", "http")
         self.api_key = api_key or os.getenv("COMFYUI_API_KEY")
         self.cookies = cookies or os.getenv("COMFYUI_COOKIES")
+        self.session_pool_size = session_pool_size if session_pool_size != 1 else int(os.getenv("COMFYUI_SESSION_POOL_SIZE", "1"))
         
         # RunningHub configuration (priority: param > env > default)
         self.runninghub_url = runninghub_url or os.getenv("RUNNINGHUB_BASE_URL", "https://www.runninghub.ai")
@@ -155,7 +157,8 @@ class ComfyKit:
             self._http_executor = HttpExecutor(
                 base_url=self.comfyui_url,
                 api_key=self.api_key,
-                cookies=self.cookies
+                cookies=self.cookies,
+                session_pool_size=self.session_pool_size,
             )
         return self._http_executor
 
@@ -320,3 +323,14 @@ class ComfyKit:
 
         return result
 
+    async def close(self):
+        if self._http_executor and hasattr(self._http_executor, "close"):
+            await self._http_executor.close()
+        if self._runninghub_executor and hasattr(self._runninghub_executor, "close"):
+            await self._runninghub_executor.close()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()

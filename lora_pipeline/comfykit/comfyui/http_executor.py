@@ -3,7 +3,10 @@ import json
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
+
+import aiohttp
 
 from comfykit.comfyui.base_executor import ComfyUIExecutor
 from comfykit.logger import logger
@@ -13,8 +16,92 @@ from comfykit.comfyui.models import ExecuteResult
 class HttpExecutor(ComfyUIExecutor):
     """HTTP executor for ComfyUI"""
 
-    def __init__(self, base_url: str = None, api_key: str = None, cookies: str = None):
+    def __init__(
+        self,
+        base_url: str = None,
+        api_key: str = None,
+        cookies: str = None,
+        session_pool_size: int = 1,
+        request_timeout: Optional[int] = None,
+    ):
         super().__init__(base_url, api_key, cookies)
+        self.session_pool_size = max(1, int(session_pool_size or 1))
+        self.request_timeout = request_timeout
+        self._session_queue: asyncio.Queue[aiohttp.ClientSession] = asyncio.Queue(maxsize=self.session_pool_size)
+        self._all_sessions: set[aiohttp.ClientSession] = set()
+        self._session_lock = asyncio.Lock()
+        self._pool_initialized = False
+        self._closed = False
+
+    async def _create_session(self) -> aiohttp.ClientSession:
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        cookies = await self._parse_comfyui_cookies()
+        timeout = aiohttp.ClientTimeout(total=self.request_timeout) if self.request_timeout and self.request_timeout > 0 else None
+        connector = aiohttp.TCPConnector(enable_cleanup_closed=True)
+        return aiohttp.ClientSession(headers=headers, cookies=cookies, timeout=timeout, connector=connector)
+
+    async def _ensure_session_pool(self):
+        if self._pool_initialized:
+            return
+        async with self._session_lock:
+            if self._pool_initialized:
+                return
+            for _ in range(self.session_pool_size):
+                session = await self._create_session()
+                self._all_sessions.add(session)
+                self._session_queue.put_nowait(session)
+            self._pool_initialized = True
+
+    @asynccontextmanager
+    async def get_comfyui_session(self):
+        if self._closed:
+            raise RuntimeError("HttpExecutor is already closed")
+        await self._ensure_session_pool()
+        session = await self._session_queue.get()
+        if session.closed:
+            async with self._session_lock:
+                self._all_sessions.discard(session)
+                if not self._closed:
+                    session = await self._create_session()
+                    self._all_sessions.add(session)
+        try:
+            yield session
+        finally:
+            if self._closed:
+                if not session.closed:
+                    await session.close()
+                return
+            if session.closed:
+                async with self._session_lock:
+                    self._all_sessions.discard(session)
+                    replacement = await self._create_session()
+                    self._all_sessions.add(replacement)
+                    await self._session_queue.put(replacement)
+            else:
+                await self._session_queue.put(session)
+
+    async def close(self):
+        async with self._session_lock:
+            if self._closed:
+                return
+            self._closed = True
+            sessions = list(self._all_sessions)
+            self._all_sessions.clear()
+            while not self._session_queue.empty():
+                try:
+                    self._session_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+        if sessions:
+            await asyncio.gather(*(session.close() for session in sessions), return_exceptions=True)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
 
     async def _queue_prompt(self, workflow: Dict[str, Any], client_id: str, prompt_ext_params: Optional[Dict[str, Any]] = None) -> str:
         """Submit workflow to queue"""

@@ -1,3 +1,20 @@
+"""
+探测comfyui端口可达性
+python /data/benchmark_metrics/lora_pipeline/probe_comfy_ports.py \
+  --shell-file /data/benchmark_metrics/lora_pipeline/illustrious_one_lora_diverse.sh \
+  --start-port 8188 \
+  --port-count 8 \
+  --timeout-sec 2 \
+  --concurrency 256 \
+  --output-file /data/benchmark_metrics/logs/comfy_port_probe_results.json
+python /data/benchmark_metrics/lora_pipeline/probe_comfy_ports.py \
+  --shell-file /data/benchmark_metrics/lora_pipeline/illustrious_dual_lora_flux.sh \
+  --start-port 8188 \
+  --port-count 8 \
+  --timeout-sec 2 \
+  --concurrency 256 \
+  --output-file /data/benchmark_metrics/logs/comfy_port_probe_results.json
+"""
 import argparse
 import asyncio
 import json

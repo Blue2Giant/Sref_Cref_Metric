@@ -33,4 +33,5 @@ python /data/benchmark_metrics/lora_pipeline/comfykit_demo_stress.py \
   --concurrency 0 \
   --session-pool-size 1 \
   --output-file /data/benchmark_metrics/logs/comfykit_downloads/comfykit_stress_results.json \
-  --download-dir /data/benchmark_metrics/logs/comfykit_downloads
+  --download-dir /data/benchmark_metrics/logs/comfykit_downloads \
+  --download-filename-prefix  ComfyUI

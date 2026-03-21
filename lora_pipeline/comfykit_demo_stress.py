@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 
@@ -45,10 +46,44 @@ def detect_image_type(data: bytes) -> str:
     return ""
 
 
+def extract_image_filename(image_url: str) -> str:
+    parsed = urlparse(image_url)
+    query = parse_qs(parsed.query)
+    return (query.get("filename") or [""])[0]
+
+
+class DownloadSessionPool:
+    def __init__(self, size: int, timeout_sec: int):
+        self.size = max(1, int(size))
+        self.timeout_sec = max(1, int(timeout_sec))
+        self._queue: asyncio.Queue[aiohttp.ClientSession] = asyncio.Queue(maxsize=self.size)
+        self._sessions: List[aiohttp.ClientSession] = []
+
+    async def __aenter__(self):
+        for _ in range(self.size):
+            timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
+            connector = aiohttp.TCPConnector(limit=0, enable_cleanup_closed=True)
+            session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+            self._sessions.append(session)
+            self._queue.put_nowait(session)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await asyncio.gather(*(s.close() for s in self._sessions), return_exceptions=True)
+        self._sessions.clear()
+
+    async def acquire(self) -> aiohttp.ClientSession:
+        return await self._queue.get()
+
+    async def release(self, session: aiohttp.ClientSession):
+        await self._queue.put(session)
+
+
 async def run_one(
     semaphore: Optional[asyncio.Semaphore],
-    download_session: aiohttp.ClientSession,
+    download_pool: DownloadSessionPool,
     download_dir: Path,
+    filename_prefix: str,
     host: str,
     port: int,
     index: int,
@@ -95,10 +130,19 @@ async def run_one(
             else:
                 image_url = result.images[0]
                 record["image_url"] = image_url
-                async with download_session.get(image_url) as response:
-                    if response.status != 200:
-                        raise Exception(f"download image failed: HTTP {response.status}")
-                    data = await response.read()
+                #前缀匹配，避免下载到其他节点的图片
+                filename = extract_image_filename(image_url)
+                if filename_prefix and not filename.startswith(filename_prefix):
+                    raise Exception(f"filename prefix mismatch: expected '{filename_prefix}', got '{filename}'")
+                #下载session池子负责下载
+                session = await download_pool.acquire()
+                try:
+                    async with session.get(image_url) as response:
+                        if response.status != 200:
+                            raise Exception(f"download image failed: HTTP {response.status}")
+                        data = await response.read()
+                finally:
+                    await download_pool.release(session)
                 if not data:
                     raise Exception("download image is empty")
                 image_type = detect_image_type(data)
@@ -180,6 +224,8 @@ async def main():
     parser.add_argument("--concurrency", type=int, default=64, help="全局并发数，传0表示不限制")
     parser.add_argument("--session-pool-size", type=int, default=2, help="每个 ComfyKit 的 session 池大小")
     parser.add_argument("--timeout-sec", type=int, default=600, help="单请求超时（秒）")
+    parser.add_argument("--download-session-count", type=int, default=1, help="下载图片会话数量")
+    parser.add_argument("--download-filename-prefix", type=str, default="", help="只下载文件名以此前缀开头的图片")
     parser.add_argument("--download-dir", type=str, default="/data/benchmark_metrics/lora_pipeline/comfykit_stress_images", help="下载并校验图片落盘目录")
     parser.add_argument("--output-file", type=str, default="/data/benchmark_metrics/lora_pipeline/comfykit_stress_results.json", help="结果输出文件")
     args = parser.parse_args()
@@ -192,9 +238,8 @@ async def main():
 
     started_at = iso_now()
     semaphore = None if args.concurrency == 0 else asyncio.Semaphore(max(1, args.concurrency))
-    timeout = aiohttp.ClientTimeout(total=max(1, args.timeout_sec))
-    connector = aiohttp.TCPConnector(limit=0, enable_cleanup_closed=True)
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as download_session:
+    filename_prefix = args.download_filename_prefix.strip()
+    async with DownloadSessionPool(size=max(1, args.download_session_count), timeout_sec=max(1, args.timeout_sec)) as download_pool:
         tasks = []
         for host in hosts:
             for port in ports:
@@ -202,8 +247,9 @@ async def main():
                     tasks.append(
                         run_one(
                             semaphore=semaphore,
-                            download_session=download_session,
+                            download_pool=download_pool,
                             download_dir=download_dir,
+                            filename_prefix=filename_prefix,
                             host=host,
                             port=port,
                             index=i,
@@ -225,6 +271,8 @@ async def main():
         "requests_per_port": args.requests_per_port,
         "concurrency": args.concurrency,
         "session_pool_size": args.session_pool_size,
+        "download_session_count": args.download_session_count,
+        "download_filename_prefix": filename_prefix,
         "download_dir": str(download_dir),
         "overall_test_success_rate": summary["success_rate"],
         "overall_test_success_ratio": summary["success_ratio"],

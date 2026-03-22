@@ -6,7 +6,7 @@ python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py 
     --sample-model-count 200 \
     --image-subdir eval_images_with_negative_new \
     --convert-jpg \
-    --jpg-quality 82
+    --jpg-quality 75
 
 python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py \
     --input-root /mnt/jfs/loras_combine/flux_0321_dual_lora \
@@ -14,7 +14,7 @@ python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py 
     --sample-model-count 200 \
     --image-subdir eval_images_with_negative_new \
     --convert-jpg \
-    --jpg-quality 82
+    --jpg-quality 75
 """
 import argparse
 import io

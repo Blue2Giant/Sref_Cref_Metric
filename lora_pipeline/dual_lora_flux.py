@@ -10,7 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import illustrious_one_lora_diverse as base
-import illustrious_one_lora_diverse_dual as dual_base
+import dual_lora_illustrious as dual_base
 from comfykit import ComfyKit
 
 

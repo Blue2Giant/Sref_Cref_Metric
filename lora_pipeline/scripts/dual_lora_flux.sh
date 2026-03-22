@@ -37,7 +37,7 @@ num_prompts=10
 negative_prompt=""
 
 while true; do
-    python /data/benchmark_metrics/lora_pipeline/illustrious_one_lora_diverse_dual_flux.py \
+    python /data/benchmark_metrics/lora_pipeline/dual_lora_flux.py \
         --lora-root "$lora_root" \
         --meta-root "$output_meta_root" \
         --output-root "$output_root" \

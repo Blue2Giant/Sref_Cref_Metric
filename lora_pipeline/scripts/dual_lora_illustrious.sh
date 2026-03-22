@@ -38,7 +38,7 @@ num_prompts=10
 negative_prompt="lowres, normal quality, worst quality, low quality, jpeg artifacts, compression artifacts, pixelated, blurry, out of focus, soft focus, bad contrast, color banding, posterization, chromatic aberration, aliasing, moire, overexposed, underexposed, blown highlights, crushed shadows, noise, watermark, logo, text, caption, signature, username, copyright, bad anatomy, malformed, disfigured, deformed, bad proportions, extra limbs, missing limbs, duplicate body parts, extra digits, missing fingers, fused fingers, webbed fingers, bad hands, bad feet, distorted face, asymmetrical eyes, cross-eye, extra face, cloned person, body cut off, cropped, floating objects, disconnected limbs, perspective errors, depth errors, incorrect shadows, inconsistent lighting, repeated patterns, mirror artifacts"
 negative_prompt=""
 while true; do
-    python /data/benchmark_metrics/lora_pipeline/illustrious_one_lora_diverse_dual.py \
+    python /data/benchmark_metrics/lora_pipeline/dual_lora_illustrious.py \
         --lora-root "$lora_root" \
         --meta-root "$output_meta_root" \
         --output-root "$output_root" \

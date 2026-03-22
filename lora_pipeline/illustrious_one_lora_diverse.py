@@ -8,6 +8,8 @@ import asyncio
 import tempfile
 import argparse
 import concurrent.futures
+import signal
+import threading
 from typing import Optional, List, Dict, Tuple, Any
 import aiohttp
 from urllib.parse import urlparse, parse_qs
@@ -43,6 +45,78 @@ STOPWORDS = {
     "is", "are", "was", "were", "be", "been", "being",
 }
 RE_OUT_IMG = re.compile(r"^(\d{5})_(\d+)\.(png|jpg|jpeg|webp|bmp)$", re.IGNORECASE)
+DEFAULT_PROBE_TIMEOUT_SEC = 2.0
+DEFAULT_PROBE_CONCURRENCY = 256
+STOP_EVENT = threading.Event()
+
+
+def _is_stopping() -> bool:
+    return STOP_EVENT.is_set()
+
+
+def _handle_stop_signal(signum, frame):
+    if STOP_EVENT.is_set():
+        os._exit(130)
+    STOP_EVENT.set()
+    print("[STOP] 捕获中断信号，正在停止任务。再次 Ctrl+C 将立即退出。")
+
+
+def _normalize_probe_host(host: str) -> Tuple[str, str]:
+    s = str(host).strip().rstrip("/")
+    if s.startswith("http://"):
+        return s, s[len("http://"):]
+    if s.startswith("https://"):
+        return s, s[len("https://"):]
+    return f"http://{s}", s
+
+
+async def _probe_one_host_port(host_with_scheme: str, host_for_tcp: str, port: int, timeout_sec: float) -> Optional[Tuple[str, int]]:
+    try:
+        fut = asyncio.open_connection(host_for_tcp, int(port))
+        reader, writer = await asyncio.wait_for(fut, timeout=timeout_sec)
+        writer.close()
+        await writer.wait_closed()
+        return host_with_scheme, int(port)
+    except Exception:
+        return None
+
+
+def probe_available_ports(host_port_list: Optional[List[Tuple[str, int]]] = None) -> List[Tuple[str, int]]:
+    pairs = host_port_list or [("http://127.0.0.1", 8188)]
+
+    async def _run() -> List[Tuple[str, int]]:
+        sem = asyncio.Semaphore(DEFAULT_PROBE_CONCURRENCY)
+
+        async def _task(host: str, port: int):
+            host_with_scheme, host_for_tcp = _normalize_probe_host(host)
+            async with sem:
+                return await _probe_one_host_port(
+                    host_with_scheme=host_with_scheme,
+                    host_for_tcp=host_for_tcp,
+                    port=int(port),
+                    timeout_sec=DEFAULT_PROBE_TIMEOUT_SEC,
+                )
+
+        tasks = [_task(h, p) for h, p in pairs]
+        results = await asyncio.gather(*tasks)
+        return [x for x in results if x is not None]
+
+    available = asyncio.run(_run())
+    if not available:
+        raise RuntimeError("No reachable ComfyUI endpoints after port probing")
+    return available
+
+
+def build_reachable_endpoints(comfy_hosts: List[str], base_port: int, num_workers: int) -> List[str]:
+    candidates: List[Tuple[str, int]] = []
+    slots_per_host = max(1, int(num_workers))
+    for host in comfy_hosts:
+        for i in range(slots_per_host):
+            candidates.append((host, int(base_port) + i))
+    if not candidates:
+        raise RuntimeError("没有构造出任何 ComfyUI endpoint")
+    reachable = probe_available_ports(candidates)
+    return [f"{host}:{port}" for host, port in reachable]
 
 
 def is_remote_path(path: str) -> bool:
@@ -641,6 +715,8 @@ async def _download_worker(
 ):
     """下载协程：消费队列中的下载任务并复用 keep-alive session。"""
     while True:
+        if _is_stopping() and download_queue.empty():
+            break
         task = await download_queue.get()
         if task is None:
             download_queue.task_done()
@@ -652,6 +728,8 @@ async def _download_worker(
         sel_idx = int(task.get("sel_idx", -1))
         ok = False
         for attempt in range(max(1, int(max_retries))):
+            if _is_stopping():
+                break
             try:
                 async with session.get(img_url) as resp:
                     if resp.status != 200:
@@ -691,127 +769,130 @@ async def run_comfy_batch_workflow(
     safe_makedirs(save_dir)
     with mopen(wf_json, "r", encoding="utf-8") as f:
         wf_template = json.load(f)
-    kit = ComfyKit(comfyui_url=url)
-
-    for sel_idx, pos_prompt in prompts_to_run:
-        wf = _deepcopy(wf_template)
-        if gen_seed is None:
-            new_seed = int.from_bytes(os.urandom(4), byteorder="big", signed=False)
-        else:
-            new_seed = int(gen_seed) + int(sel_idx)
-        raw_prefix = f"{lora_name}_{sel_idx:05d}_{uuid.uuid4().hex}"
-        #注入prefix防止串图
-        filename_prefix = re.sub(r"[^0-9A-Za-z_\-]+", "_", raw_prefix)
-        _inject_workflow_payload(
-            wf,
-            seed=int(new_seed),
-            base_model_name=base_model_name,
-            lora_name=lora_name,
-            strength_model=float(strength_model),
-            strength_clip=float(strength_clip),
-            positive_prompt=pos_prompt,
-            filename_prefix=filename_prefix,
-        )
-
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tf:
-            json.dump(wf, tf, ensure_ascii=False, indent=2)
-            temp_json = tf.name
-
-        try:
-            if exec_timeout and float(exec_timeout) > 0:
-                result = await asyncio.wait_for(kit.execute(temp_json), timeout=float(exec_timeout))
+    async with ComfyKit(comfyui_url=url) as kit:
+        for sel_idx, pos_prompt in prompts_to_run:
+            if _is_stopping():
+                break
+            wf = _deepcopy(wf_template)
+            if gen_seed is None:
+                new_seed = int.from_bytes(os.urandom(4), byteorder="big", signed=False)
             else:
-                result = await kit.execute(temp_json)
-        except asyncio.TimeoutError:
-            continue
-        finally:
-            #最后无论如何都要删掉临时json
+                new_seed = int(gen_seed) + int(sel_idx)
+            raw_prefix = f"{lora_name}_{sel_idx:05d}_{uuid.uuid4().hex}"
+            filename_prefix = re.sub(r"[^0-9A-Za-z_\-]+", "_", raw_prefix)
+            _inject_workflow_payload(
+                wf,
+                seed=int(new_seed),
+                base_model_name=base_model_name,
+                lora_name=lora_name,
+                strength_model=float(strength_model),
+                strength_clip=float(strength_clip),
+                positive_prompt=pos_prompt,
+                filename_prefix=filename_prefix,
+            )
+
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tf:
+                json.dump(wf, tf, ensure_ascii=False, indent=2)
+                temp_json = tf.name
+
             try:
-                os.remove(temp_json)
-            except OSError:
-                pass
+                if exec_timeout and float(exec_timeout) > 0:
+                    result = await asyncio.wait_for(kit.execute(temp_json), timeout=float(exec_timeout))
+                else:
+                    result = await kit.execute(temp_json)
+            except asyncio.TimeoutError:
+                continue
+            finally:
+                try:
+                    os.remove(temp_json)
+                except OSError:
+                    pass
 
-        images_all = getattr(result, "images", None) or []
-        images: List[str] = []
-        mismatch_log = os.path.join(save_dir, "mismatch_log.txt")
+            if _is_stopping():
+                break
 
-        for item in images_all:
-            if isinstance(item, str):
-                url_i = item
-            elif isinstance(item, dict):
-                url_i = item.get("url") or item.get("image_url") or item.get("filename") or ""
-                if not url_i:
-                    continue
-            else:
-                url_i = str(item)
-            fname = _get_filename_from_url(url_i)
-            #prefix过滤，防止串图
-            if fname.startswith(filename_prefix):
-                images.append(url_i)
-            else:
-                _append_text_line(mismatch_log, f"sel_idx={sel_idx} prefix={filename_prefix} filename={fname} url={url_i}")
+            images_all = getattr(result, "images", None) or []
+            images: List[str] = []
+            mismatch_log = os.path.join(save_dir, "mismatch_log.txt")
 
-        if not images:
-            _append_text_line(mismatch_log, f"sel_idx={sel_idx} prefix={filename_prefix} no_valid_image, images_all_len={len(images_all)}")
-            continue
-        # 去重，保留第一个
-        images = list(dict.fromkeys([u for u in images if u]))[:1]
-        for img_idx, img_url in enumerate(images):
-            prefix = f"{sel_idx:05d}_{img_idx}"
-            img_path = join_path(save_dir, prefix + ".png")
-            meta_path = join_path(save_dir, prefix + ".json")
-            img_url = img_url.strip() if isinstance(img_url, str) else str(img_url)
-            meta = None
-            if save_prompt_json:
-                meta = {
-                    "base_model": base_model_name,
-                    "lora_name": lora_name,
-                    "strength_model": float(strength_model),
-                    "strength_clip": float(strength_clip),
-                    "positive_prompt": pos_prompt,
-                    "seed": int(new_seed),
-                    "workflow": wf_json,
-                    "mode": "custom_workflow",
-                    "sel_idx": int(sel_idx),
-                    "endpoint": url,
-                }
-            # 如果有下载队列的话就把下载任务放到队列里，否则直接下载
-            if download_queue is not None:
-                await download_queue.put(
-                    {
-                        "img_url": img_url,
-                        "img_path": img_path,
-                        "meta_path": meta_path,
-                        "meta": meta,
+            for item in images_all:
+                if isinstance(item, str):
+                    url_i = item
+                elif isinstance(item, dict):
+                    url_i = item.get("url") or item.get("image_url") or item.get("filename") or ""
+                    if not url_i:
+                        continue
+                else:
+                    url_i = str(item)
+                fname = _get_filename_from_url(url_i)
+                if fname.startswith(filename_prefix):
+                    images.append(url_i)
+                else:
+                    _append_text_line(mismatch_log, f"sel_idx={sel_idx} prefix={filename_prefix} filename={fname} url={url_i}")
+
+            if not images:
+                _append_text_line(mismatch_log, f"sel_idx={sel_idx} prefix={filename_prefix} no_valid_image, images_all_len={len(images_all)}")
+                continue
+            images = list(dict.fromkeys([u for u in images if u]))[:1]
+            for img_idx, img_url in enumerate(images):
+                if _is_stopping():
+                    break
+                prefix = f"{sel_idx:05d}_{img_idx}"
+                img_path = join_path(save_dir, prefix + ".png")
+                meta_path = join_path(save_dir, prefix + ".json")
+                img_url = img_url.strip() if isinstance(img_url, str) else str(img_url)
+                meta = None
+                if save_prompt_json:
+                    meta = {
+                        "base_model": base_model_name,
+                        "lora_name": lora_name,
+                        "strength_model": float(strength_model),
+                        "strength_clip": float(strength_clip),
+                        "positive_prompt": pos_prompt,
+                        "seed": int(new_seed),
+                        "workflow": wf_json,
+                        "mode": "custom_workflow",
                         "sel_idx": int(sel_idx),
+                        "endpoint": url,
                     }
-                )
-            else:
-                max_retries = 3
-                retry_delay = 2
-                success = False
-                for attempt in range(max_retries):
-                    try:
-                        req = Request(img_url, headers={"User-Agent": "Mozilla/5.0", "Connection": "close"})
-                        with urlopen(req, timeout=300) as resp:
-                            status_code = getattr(resp, "status", 200)
-                            if status_code != 200:
-                                if attempt < max_retries - 1:
-                                    time.sleep(retry_delay * (2 ** attempt))
-                                continue
-                            content = resp.read()
-                        _write_binary(img_path, content)
-                        if isinstance(meta, dict):
-                            _write_json(meta_path, meta)
-                        success = True
-                        break
-                    except (HTTPError, URLError):
-                        if attempt < max_retries - 1:
-                            time.sleep(retry_delay * (2 ** attempt))
-                    except Exception:
-                        break
-                if not success:
-                    continue
+                if download_queue is not None:
+                    await download_queue.put(
+                        {
+                            "img_url": img_url,
+                            "img_path": img_path,
+                            "meta_path": meta_path,
+                            "meta": meta,
+                            "sel_idx": int(sel_idx),
+                        }
+                    )
+                else:
+                    max_retries = 3
+                    retry_delay = 2
+                    success = False
+                    for attempt in range(max_retries):
+                        if _is_stopping():
+                            break
+                        try:
+                            req = Request(img_url, headers={"User-Agent": "Mozilla/5.0", "Connection": "close"})
+                            with urlopen(req, timeout=300) as resp:
+                                status_code = getattr(resp, "status", 200)
+                                if status_code != 200:
+                                    if attempt < max_retries - 1:
+                                        time.sleep(retry_delay * (2 ** attempt))
+                                    continue
+                                content = resp.read()
+                            _write_binary(img_path, content)
+                            if isinstance(meta, dict):
+                                _write_json(meta_path, meta)
+                            success = True
+                            break
+                        except (HTTPError, URLError):
+                            if attempt < max_retries - 1:
+                                time.sleep(retry_delay * (2 ** attempt))
+                        except Exception:
+                            break
+                    if not success:
+                        continue
 
 
 async def _run_with_download_queue(
@@ -855,7 +936,7 @@ async def _run_with_download_queue(
         ]
         try:
             for round_idx in range(total_rounds):
-                if not remain_to_run:
+                if _is_stopping() or not remain_to_run:
                     break
                 await run_comfy_batch_workflow(
                     wf_json=wf_json,
@@ -871,6 +952,8 @@ async def _run_with_download_queue(
                     download_queue=download_queue,
                 )
                 await download_queue.join()
+                if _is_stopping():
+                    break
                 done_after = set(scan_done_prompt_indices(eval_dir))
                 remain_to_run = [(i, selected_prompts[i]) for i in indices_to_run if i not in done_after]
                 if remain_to_run and round_idx + 1 < total_rounds:
@@ -1191,6 +1274,8 @@ def process_one_lora(
     download_workers: int = 4,
 ):
     """处理单个 LoRA 的完整生成流程。"""
+    if _is_stopping():
+        return
     lora_name = os.path.basename(lora_path)
     stem, _ = os.path.splitext(lora_name)
     m = re.match(r"(\d+)", stem)
@@ -1255,6 +1340,8 @@ def process_one_lora(
             return
         indices_to_run = [i for i in range(N) if i not in done_indices]
     prompts_to_run = [(i, selected_prompts[i]) for i in indices_to_run]
+    if _is_stopping():
+        return
 
     runtime_wf_json = wf_json
     created_runtime_wf = False
@@ -1345,6 +1432,8 @@ def process_one(
     download_workers: int,
 ) -> Tuple[str, Optional[bool]]:
     """线程 worker 的单任务包装函数。用于捕捉线程失败原因"""
+    if _is_stopping():
+        return lora_path, False
     try:
         process_one_lora(
             lora_path=lora_path,
@@ -1372,7 +1461,7 @@ def process_one(
             negative_node_id=negative_node_id,
             download_workers=download_workers,
         )
-        return lora_path, True
+        return lora_path, False if _is_stopping() else True
     except Exception as e:
         print(f"[WORKER] 处理 LoRA 失败: {lora_path} ----> {e}")
         return lora_path, None
@@ -1380,6 +1469,9 @@ def process_one(
 
 def main():
     """命令行入口，组织参数解析与并发调度。"""
+    STOP_EVENT.clear()
+    signal.signal(signal.SIGINT, _handle_stop_signal)
+    signal.signal(signal.SIGTERM, _handle_stop_signal)
     parser = argparse.ArgumentParser(description="批量生成 eval_images（standalone）")
     parser.add_argument("--lora-root", required=True)
     parser.add_argument("--meta-root", required=True)
@@ -1431,14 +1523,12 @@ def main():
                 comfy_hosts.append(part.rstrip("/"))
     comfy_hosts = list(dict.fromkeys(comfy_hosts)) or ["http://127.0.0.1"]
 
-    slots_per_host = max(1, args.num_workers)
-    endpoints: List[str] = []
-    for host in comfy_hosts:
-        for i in range(slots_per_host):
-            endpoints.append(f"{host}:{args.base_port + i}")
-    if not endpoints:
-        raise RuntimeError("没有构造出任何 ComfyUI endpoint")
-
+    endpoints = build_reachable_endpoints(
+        comfy_hosts=comfy_hosts,
+        base_port=args.base_port,
+        num_workers=args.num_workers,
+    )
+    print("available endpoints: =====> ", len(endpoints))
     base_prompt_txt_local = prepare_prompt_txt(args.prompt_txt, args.local_tmp_root)
     meta_index = build_meta_index(meta_root)
 
@@ -1497,7 +1587,9 @@ def main():
         ep_idx = idx % len(endpoints)
         tasks.append((p, endpoints[ep_idx]))
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_workers)
+    futures: Dict[concurrent.futures.Future, str] = {}
+    try:
         futures = {
             executor.submit(
                 process_one,
@@ -1528,12 +1620,35 @@ def main():
             ): lora_path
             for lora_path, comfy_url in tasks
         }
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
-            key = futures[future]
-            try:
-                future.result()
-            except Exception as exc:
-                print(f"{key} generated an exception: {exc}")
+        pending = set(futures.keys())
+        progress = tqdm(total=len(futures))
+        try:
+            while pending:
+                if _is_stopping():
+                    break
+                done, pending = concurrent.futures.wait(
+                    pending,
+                    timeout=0.5,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    key = futures[future]
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        print(f"{key} generated an exception: {exc}")
+                    finally:
+                        progress.update(1)
+        finally:
+            progress.close()
+        if _is_stopping():
+            print("[STOP] 正在取消未完成任务...")
+    finally:
+        for f in futures:
+            f.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        if _is_stopping():
+            raise SystemExit(130)
 
 
 if __name__ == "__main__":

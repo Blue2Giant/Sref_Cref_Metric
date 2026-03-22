@@ -28,8 +28,8 @@ def _inject_flux_workflow_payload(
     wf["31"]["inputs"]["seed"] = int(seed)
     wf["41"]["inputs"]["clip_l"] = str(positive_prompt)
     wf["41"]["inputs"]["t5xxl"] = str(positive_prompt)
-    wf["43"]["inputs"]["clip_l"] = str(negative_prompt)
-    wf["43"]["inputs"]["t5xxl"] = str(negative_prompt)
+    wf["43"]["inputs"]["clip_l"] = str(negative_prompt) if negative_prompt else wf["43"]["inputs"]["clip_l"]
+    wf["43"]["inputs"]["t5xxl"] = str(negative_prompt) if negative_prompt else wf["43"]["inputs"]["t5xxl"]
     wf["45"]["inputs"]["lora_name"] = str(lora_name)
     wf["45"]["inputs"]["strength_model"] = float(strength_model)
     wf["45"]["inputs"]["strength_clip"] = float(strength_clip)

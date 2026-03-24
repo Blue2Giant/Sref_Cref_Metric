@@ -5,11 +5,11 @@ ip3=10.201.19.23
 ip4=10.201.19.23
 ip5=10.201.17.65
 ip6=10.201.19.53
-ip7=10.201.18.8
+ip7=10.201.16.11
 ip8=10.201.19.16
-ip9=10.201.19.28
+ip9=10.201.19.39
 ip10=10.201.17.59
-ip11=10.201.16.41
+ip11=10.201.19.41
 ip12=10.201.16.34
 ip13=10.201.18.6
 ip14=10.201.17.36
@@ -26,7 +26,8 @@ ip24=10.201.16.50
 ip25=10.201.17.33
 ip26=10.201.16.49
 ip27=10.201.17.29
-ip28=10.201.19.33
+ip28=10.191.13.9
+ip29=10.201.17.43
 
 output_meta_root=s3://lanjinghong-data/loras_eval_flux_debug_1226
 lora_root=s3://collect-data-datasets/202510/civitai_file/'Flux.1 D'
@@ -35,6 +36,9 @@ pair_model_id_txt=/data/benchmark_metrics/lora_pipeline/meta/model_ids/flux_styl
 prompt_txt=/data/benchmark_metrics/lora_pipeline/meta/prompts/OTHER_UNIVERSE_TRIGGER.txt
 num_prompts=10
 negative_prompt=""
+
+prompt_txt=/data/benchmark_metrics/lora_pipeline/meta/prompts/TRIPLET_UNIVERSE_TRIGGER.txt
+output_root=/mnt/jfs/loras_combine/flux_0323_dual_lora_diverse_save_prompt
 
 while true; do
     python /data/benchmark_metrics/lora_pipeline/dual_lora_flux.py \

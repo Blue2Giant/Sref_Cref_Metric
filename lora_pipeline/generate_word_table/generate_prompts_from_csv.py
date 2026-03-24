@@ -15,7 +15,7 @@ import argparse
 import csv
 import os
 import random
-from typing import List, Set
+from typing import List, Set, Tuple
 
 
 def load_columns_from_csv(input_csv: str, delimiter: str = ",", has_header: bool = False) -> List[List[str]]:
@@ -47,17 +47,27 @@ def load_columns_from_csv(input_csv: str, delimiter: str = ",", has_header: bool
     return columns
 
 
-def load_existing_prompts(output_txt: str) -> List[str]:
+def normalize_prompt(prompt: str) -> str:
+    parts = [x.strip() for x in str(prompt).split(",")]
+    parts = [x for x in parts if x]
+    return ", ".join(parts)
+
+
+def load_existing_prompts(output_txt: str) -> Tuple[List[str], Set[str]]:
     if not os.path.exists(output_txt):
-        return []
+        return [], set()
 
     existing_prompts: List[str] = []
+    seen: Set[str] = set()
     with open(output_txt, "r", encoding="utf-8") as f:
         for line in f:
-            text = line.strip()
+            text = normalize_prompt(line.strip())
             if text:
+                if text in seen:
+                    continue
+                seen.add(text)
                 existing_prompts.append(text)
-    return existing_prompts
+    return existing_prompts, seen
 
 
 def sample_single_prompt(
@@ -67,24 +77,25 @@ def sample_single_prompt(
     min_terms_per_column: int,
     max_terms_per_column: int,
     replace_space_with_underscore: bool = False,
+    rng: random.Random = random,
 ) -> str:
     total_cols = len(columns)
-    col_pick_count = random.randint(min_columns, max_columns)
-    picked_col_indices = random.sample(range(total_cols), k=col_pick_count)
+    col_pick_count = rng.randint(min_columns, max_columns)
+    picked_col_indices = rng.sample(range(total_cols), k=col_pick_count)
 
     parts: List[str] = []
     for col_idx in picked_col_indices:
         col_values = columns[col_idx]
         upper = min(max_terms_per_column, len(col_values))
         lower = min(min_terms_per_column, upper)
-        term_count = random.randint(lower, upper)
+        term_count = rng.randint(lower, upper)
         if term_count > 0:
-            terms = random.sample(col_values, k=term_count)
+            terms = rng.sample(col_values, k=term_count)
             if replace_space_with_underscore:
                 terms = [t.replace(" ", "_") for t in terms]
             parts.extend(terms)
 
-    return ", ".join(parts)
+    return normalize_prompt(", ".join(parts))
 
 
 def sample_non_empty_prompt(
@@ -95,6 +106,7 @@ def sample_non_empty_prompt(
     max_terms_per_column: int,
     replace_space_with_underscore: bool = False,
     max_retries: int = 30,
+    rng: random.Random = random,
 ) -> str:
     for _ in range(max_retries):
         prompt = sample_single_prompt(
@@ -104,15 +116,16 @@ def sample_non_empty_prompt(
             min_terms_per_column=min_terms_per_column,
             max_terms_per_column=max_terms_per_column,
             replace_space_with_underscore=replace_space_with_underscore,
+            rng=rng,
         )
         if prompt:
             return prompt
 
-    fallback_col = random.choice(columns)
-    fallback_term = random.choice(fallback_col)
+    fallback_col = rng.choice(columns)
+    fallback_term = rng.choice(fallback_col)
     if replace_space_with_underscore:
-        return fallback_term.replace(" ", "_")
-    return fallback_term
+        return normalize_prompt(fallback_term.replace(" ", "_"))
+    return normalize_prompt(fallback_term)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -178,8 +191,7 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.seed is not None:
-        random.seed(args.seed)
+    rng = random.Random(args.seed) if args.seed is not None else random.Random()
 
     columns = load_columns_from_csv(
         input_csv=args.input_csv,
@@ -192,8 +204,7 @@ def main() -> None:
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    existing_prompts = load_existing_prompts(args.output_txt)
-    seen: Set[str] = set(existing_prompts)
+    existing_prompts, seen = load_existing_prompts(args.output_txt)
     prompts: List[str] = list(existing_prompts)
 
     if len(prompts) > args.num_prompts:
@@ -205,6 +216,7 @@ def main() -> None:
         return
 
     attempts = 0
+    no_new_streak = 0
     while len(prompts) < args.num_prompts:
         if attempts >= args.max_attempts:
             raise RuntimeError(
@@ -220,12 +232,21 @@ def main() -> None:
             min_terms_per_column=args.min_terms_per_column,
             max_terms_per_column=args.max_terms_per_column,
             replace_space_with_underscore=args.replace_space_with_underscore,
+            rng=rng,
         )
         attempts += 1
 
         if prompt not in seen:
             seen.add(prompt)
             prompts.append(prompt)
+            no_new_streak = 0
+        else:
+            no_new_streak += 1
+            if no_new_streak >= min(100000, args.max_attempts):
+                raise RuntimeError(
+                    "连续大量采样均命中历史/重复，组合空间可能接近耗尽；"
+                    "请放宽采样参数或降低目标数量。"
+                )
 
     with open(args.output_txt, "w", encoding="utf-8") as f:
         for prompt in prompts:

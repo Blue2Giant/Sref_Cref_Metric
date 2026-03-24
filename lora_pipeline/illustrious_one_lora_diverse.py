@@ -1222,12 +1222,15 @@ def select_diverse_prompts_for_model(
     k = min(num_prompts, len(all_prompts))
     if not overwrite:
         old = _load_selected_prompts_if_any(eval_dir)
-        if old and isinstance(old.get("prompts"), list) and int(old.get("num_prompts", -1)) == k:
+        old_prompts = old.get("base_prompts") if isinstance(old, dict) else None
+        if not isinstance(old_prompts, list) and isinstance(old, dict):
+            old_prompts = old.get("prompts")
+        if old and isinstance(old_prompts, list) and int(old.get("num_prompts", -1)) == k:
             old_tr = (old.get("trigger_word") or "").strip()
             old_pp = (old.get("prefix_phrase") or "").strip()
             old_st = (old.get("strategy") or "").strip()
             if old_tr == (trigger_word or "").strip() and old_pp == (prefix_phrase or "").strip() and old_st == strategy:
-                prompts = [str(x) for x in old["prompts"] if str(x).strip()]
+                prompts = [str(x) for x in old_prompts if str(x).strip()]
                 if len(prompts) == k:
                     return prompts
     rng = random.Random(int(prompt_seed) + _stable_model_offset(model_id))
@@ -1242,6 +1245,7 @@ def select_diverse_prompts_for_model(
         "strategy": strategy,
         "indices": indices,
         "prompts": selected,
+        "base_prompts": selected,
     }
     _save_selected_prompts(eval_dir, manifest)
     return selected
@@ -1329,6 +1333,21 @@ def process_one_lora(
         overwrite=overwrite,
     )
     selected_prompts = _attach_prefix_and_trigger_to_prompts(selected_base_prompts, trigger_word, prefix_phrase)
+    old_manifest = _load_selected_prompts_if_any(eval_dir) or {}
+    _save_selected_prompts(
+        eval_dir,
+        {
+            "model_id": model_id,
+            "num_prompts": len(selected_prompts),
+            "prompt_seed": int(prompt_seed),
+            "trigger_word": (trigger_word or "").strip(),
+            "prefix_phrase": (prefix_phrase or "").strip(),
+            "strategy": old_manifest.get("strategy") or "greedy_maxmin_jaccard",
+            "indices": old_manifest.get("indices") or list(range(len(selected_prompts))),
+            "prompts": selected_prompts,
+            "base_prompts": selected_base_prompts,
+        },
+    )
     N = len(selected_prompts)
     done_indices = set(scan_done_prompt_indices(eval_dir))
     done_cnt = len(done_indices)

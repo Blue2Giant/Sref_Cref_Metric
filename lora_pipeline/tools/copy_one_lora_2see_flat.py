@@ -18,10 +18,11 @@ python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
   --eval-subfolder eval_images/ \
   --one-subfolder eval_images_with_negative_new \
   --only-model-ids /data/LoraPipeline/similarity_stats/qwen_ids.txt \
+  --limit-model-count 100 \
   --limit-eval-per-model 4 \
   --limit-one-per-model 4
 
-python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
+python /data/benchmark_metrics/lora_pipeline/tools/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_flux_debug_1226 \
   --one-lora-root /mnt/jfs/loras_combine/flux_0321_one_lora \
   --out-root /mnt/jfs/loras_combine/flux_merged_eval_compare_flat_content_0321 \
@@ -29,17 +30,25 @@ python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
   --one-subfolder eval_images_with_negative_new \
   --only-model-ids /data/LoraPipeline/assets/flux_content_sample.txt \
   --limit-eval-per-model 4 \
-  --limit-one-per-model 4
+  --limit-one-per-model 4 \
+  --convert-jpg \
+  --jpg-quality 75 \
+  --limit-model-count 200
 
-python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
+python /data/benchmark_metrics/lora_pipeline/tools/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_flux_debug_1226 \
-  --one-lora-root /mnt/jfs/loras_combine/flux_0318_one_lora \
-  --out-root /mnt/jfs/loras_combine/flux_merged_eval_compare_flat_style_v4a \
+  --one-lora-root /mnt/jfs/loras_combine/flux_0321_one_lora \
+  --out-root /mnt/jfs/loras_combine/flux_merged_eval_compare_flat_style_0321_all \
   --eval-subfolder eval_images_with_negative/ \
   --one-subfolder eval_images_with_negative_new \
-  --only-model-ids /data/LoraPipeline/assets/flux_style_1.txt \
+  --only-model-ids /data/benchmark_metrics/lora_pipeline/meta/model_ids/flux_style_1.txt \
   --limit-eval-per-model 4 \
-  --limit-one-per-model 4
+  --limit-one-per-model 4 \
+  --convert-jpg \
+  --jpg-quality 75 \
+  --limit-model-count 0 \
+  --workers 128
+
 
 python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_illustrious_one_img_magic \
@@ -64,6 +73,16 @@ python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
   --limit-one-per-model 4
 
 python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
+  --eval-root /mnt/jfs/loras_combine/qwen_0323_one_lora \
+  --one-lora-root /mnt/jfs/loras_combine/qwen_0316_one_lora \
+  --out-root /mnt/jfs/loras_combine/qwen_0323_one_lora_2see \
+  --eval-subfolder eval_images_with_negative_new/ \
+  --one-subfolder eval_images_with_negative_new \
+  --only-model-ids /data/LoraPipeline/similarity_stats/qwen_ids.txt \
+  --limit-eval-per-model 10 \
+  --limit-one-per-model 10
+
+python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_flux_debug_1226 \
   --one-lora-root /mnt/jfs/loras_combine/flux_0318_one_lora \
   --out-root /mnt/jfs/loras_combine/flux_merged_eval_compare_flat_content_v4b \
@@ -77,6 +96,7 @@ import os
 import re
 import argparse
 import io
+import concurrent.futures
 from typing import List, Tuple, Optional
 from PIL import Image
 
@@ -144,6 +164,59 @@ def smart_copy_with_optional_jpg_compress(
         rgb.save(out, format="JPEG", quality=int(jpg_quality), optimize=True)
     with mf.smart_open(dst, "wb") as f:
         f.write(out.getvalue())
+
+
+def copy_single_task(
+    src: str,
+    dst: str,
+    overwrite: bool,
+    convert_jpg: bool,
+    jpg_quality: int,
+    model_id: str,
+) -> bool:
+    try:
+        smart_copy_with_optional_jpg_compress(
+            src=src,
+            dst=dst,
+            overwrite=overwrite,
+            convert_jpg=convert_jpg,
+            jpg_quality=jpg_quality,
+        )
+        return True
+    except Exception as e:
+        print(f"[WARN] {model_id}: 跳过异常图片 {src} err={e}")
+        return False
+
+
+def copy_pair_task(
+    src_eval: str,
+    dst_eval: str,
+    src_one: str,
+    dst_one: str,
+    overwrite: bool,
+    convert_jpg: bool,
+    jpg_quality: int,
+    model_id: str,
+) -> bool:
+    try:
+        smart_copy_with_optional_jpg_compress(
+            src=src_eval,
+            dst=dst_eval,
+            overwrite=overwrite,
+            convert_jpg=convert_jpg,
+            jpg_quality=jpg_quality,
+        )
+        smart_copy_with_optional_jpg_compress(
+            src=src_one,
+            dst=dst_one,
+            overwrite=overwrite,
+            convert_jpg=convert_jpg,
+            jpg_quality=jpg_quality,
+        )
+        return True
+    except Exception as e:
+        print(f"[WARN] {model_id}: 跳过异常配对 src_eval={src_eval} src_one={src_one} err={e}")
+        return False
 
 
 def is_image(name: str, exts: List[str]) -> bool:
@@ -219,9 +292,11 @@ def main():
     ap.add_argument("--exts", default=",".join(IMAGE_EXTS_DEFAULT), help="图片后缀，逗号分隔")
     ap.add_argument("--dry-run", action="store_true", help="只打印计划，不实际拷贝")
     ap.add_argument("--only-model-ids", default=None, help="可选：逗号分隔 model_id，或 txt 路径")
+    ap.add_argument("--limit-model-count", type=int, default=0, help="最多处理多少个 model_id（<=0 表示全量）")
     ap.add_argument("--limit-per-model", type=int, default=0, help="每个 model 最多处理多少对（<=0 不限制）")
     ap.add_argument("--limit-eval-per-model", type=int, default=0, help="每个 model 最多拷贝 eval 数（<=0 不限制）")
     ap.add_argument("--limit-one-per-model", type=int, default=0, help="每个 model 最多拷贝 one_lora 数（<=0 不限制）")
+    ap.add_argument("--workers", type=int, default=32, help="并发拷贝线程数，默认 32")
     ap.add_argument("--overwrite", action="store_true", help="同名覆盖")
     ap.add_argument("--convert-jpg", action="store_true", help="可选：输出时统一转为 JPG 压缩")
     ap.add_argument(
@@ -241,6 +316,7 @@ def main():
     exts = [x.strip().lower() for x in args.exts.split(",") if x.strip()]
     dry_run = bool(args.dry_run)
     overwrite = True if not args.overwrite else True
+    workers = max(1, int(args.workers))
     if not (1 <= int(args.jpg_quality) <= 95):
         raise RuntimeError("--jpg-quality 必须在 1~95")
     eval_subfolder = (args.eval_subfolder or args.subfolder).strip().strip("/")
@@ -259,6 +335,8 @@ def main():
     mids = sorted(mids_a)
     if only_set is not None:
         mids = [m for m in mids if m in only_set]
+    if args.limit_model_count > 0:
+        mids = mids[: int(args.limit_model_count)]
     if not mids:
         print("[WARN] 没有可处理的 model_id")
         return 0
@@ -268,6 +346,9 @@ def main():
 
     total_pairs = 0
     total_eval_only = 0
+    total_skipped = 0
+    futures: List[Tuple[concurrent.futures.Future, str]] = []
+    executor = None if dry_run else concurrent.futures.ThreadPoolExecutor(max_workers=workers)
     for model_id in mids:
         eval_dir, one_dir = build_paths(
             eval_root=eval_root,
@@ -302,13 +383,17 @@ def main():
                 if dry_run:
                     print(f"[DRY] {src_eval} -> {dst_eval}")
                 else:
-                    smart_copy_with_optional_jpg_compress(
-                        src=src_eval,
-                        dst=dst_eval,
-                        overwrite=overwrite,
-                        convert_jpg=bool(args.convert_jpg),
-                        jpg_quality=int(args.jpg_quality),
+                    fut = executor.submit(
+                        copy_single_task,
+                        src_eval,
+                        dst_eval,
+                        overwrite,
+                        bool(args.convert_jpg),
+                        int(args.jpg_quality),
+                        model_id,
                     )
+                    futures.append((fut, "eval_only"))
+                    continue
                 total_eval_only += 1
             print(f"[OK] {model_id}: 仅拷贝 eval {n} 张")
             continue
@@ -335,26 +420,38 @@ def main():
                 print(f"[DRY] {src_eval} -> {dst_eval}")
                 print(f"[DRY] {src_one}  -> {dst_one}")
             else:
-                smart_copy_with_optional_jpg_compress(
-                    src=src_eval,
-                    dst=dst_eval,
-                    overwrite=overwrite,
-                    convert_jpg=bool(args.convert_jpg),
-                    jpg_quality=int(args.jpg_quality),
+                fut = executor.submit(
+                    copy_pair_task,
+                    src_eval,
+                    dst_eval,
+                    src_one,
+                    dst_one,
+                    overwrite,
+                    bool(args.convert_jpg),
+                    int(args.jpg_quality),
+                    model_id,
                 )
-                smart_copy_with_optional_jpg_compress(
-                    src=src_one,
-                    dst=dst_one,
-                    overwrite=overwrite,
-                    convert_jpg=bool(args.convert_jpg),
-                    jpg_quality=int(args.jpg_quality),
-                )
+                futures.append((fut, "pair"))
+                continue
             total_pairs += 1
 
         print(f"[OK] {model_id}: 拷贝配对完成 {n} 对")
 
+    if executor is not None:
+        for fut, kind in futures:
+            ok = fut.result()
+            if ok:
+                if kind == "pair":
+                    total_pairs += 1
+                else:
+                    total_eval_only += 1
+            else:
+                total_skipped += 1
+        executor.shutdown(wait=True)
+
     print(f"[DONE] 总共拷贝配对图片对数: {total_pairs}")
     print(f"[DONE] 仅拷贝 eval（未拷贝 one_lora）数量: {total_eval_only}")
+    print(f"[DONE] 跳过异常图片/配对数量: {total_skipped}")
     return 0
 
 

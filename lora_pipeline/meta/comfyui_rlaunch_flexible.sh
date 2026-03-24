@@ -1,6 +1,7 @@
 #!/bin/bash
-# /data/benchmark_metrics/lora_pipeline/meta/comfyui_rlaunch_flexible.sh -G maintain -c 80 -m 720000 -g 4 -t H100,H800
+# /data/benchmark_metrics/lora_pipeline/meta/comfyui_rlaunch_flexible.sh -G maintain -c 80 -m 800000 -g 4 -t H100,H800
 set -euo pipefail
+trap '' HUP
 
 DEFAULT_GROUP="l40s_yangtong"
 DEFAULT_CPU="40"
@@ -181,7 +182,12 @@ launch_once() {
 }
 
 while true; do
-  launch_once
+  if launch_once; then
+    echo "rlaunch 任务完成，准备下一轮。"
+  else
+    code=$?
+    echo "rlaunch 任务异常退出(ExitCode=${code})，按原参数重试..."
+  fi
   if [[ "$ONCE" == true ]]; then
     break
   fi

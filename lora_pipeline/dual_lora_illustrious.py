@@ -101,7 +101,8 @@ def _inject_dual_workflow_payload(
     wf["1"]["inputs"]["ckpt_name"] = str(model_name)
     wf["5"]["inputs"]["seed"] = int(seed)
     wf["18"]["inputs"]["text"] = str(positive_prompt)
-    wf["19"]["inputs"]["text"] = str(negative_prompt) if  negative_prompt else  wf["19"]["inputs"]["text"]  #只有不为空的时候才注入
+    if negative_prompt: 
+        wf["19"]["inputs"]["text"] = str(negative_prompt) 
     wf["15"]["inputs"]["lora_name"] = str(content_lora_name)
     wf["15"]["inputs"]["strength_model"] = float(strength_model)
     wf["15"]["inputs"]["strength_clip"] = float(strength_clip)
@@ -304,6 +305,20 @@ def process_one_pair(
         overwrite=overwrite,
     )
     selected_prompts = _attach_dual_triggers(selected_base_prompts, content_trigger, style_trigger, prefix_phrase)
+    prompt_record_path = base.join_path(model_output_dir, "selected_prompts_final.json")
+    base._write_json(
+        prompt_record_path,
+        {
+            "pair_id": pair_id,
+            "content_model_id": content_model_id,
+            "style_model_id": style_model_id,
+            "content_trigger": content_trigger,
+            "style_trigger": style_trigger,
+            "prefix_phrase": prefix_phrase,
+            "selected_base_prompts": selected_base_prompts,
+            "selected_prompts": selected_prompts,
+        },
+    )
     N = len(selected_prompts)
     done_indices = set(base.scan_done_prompt_indices(eval_dir))
     if overwrite:

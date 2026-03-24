@@ -8,7 +8,7 @@ python /data/benchmark_metrics/lora_pipeline/probe_comfy_ports.py \
   --concurrency 256 \
   --output-file /data/benchmark_metrics/logs/comfy_port_probe_results.json
 python /data/benchmark_metrics/lora_pipeline/probe_comfy_ports.py \
-  --shell-file /data/benchmark_metrics/lora_pipeline/illustrious_dual_lora_flux.sh \
+  --shell-file /data/benchmark_metrics/lora_pipeline/scripts/dual_lora_illustrious.sh \
   --start-port 8188 \
   --port-count 8 \
   --timeout-sec 2 \

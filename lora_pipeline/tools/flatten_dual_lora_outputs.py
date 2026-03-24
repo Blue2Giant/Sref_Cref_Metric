@@ -1,7 +1,7 @@
 """
 展平双lora的结果
 python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py \
-    --input-root /mnt/jfs/loras_combine/illustrious_0322_dual_lora \
+    --input-root /mnt/jfs/loras_combine/illustrious_0323_dual_lora \
     --output-root /mnt/jfs/loras_combine/illustrious_dual_lora_see \
     --sample-model-count 200 \
     --image-subdir eval_images_with_negative_new \
@@ -9,21 +9,58 @@ python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py 
     --jpg-quality 75
 
 python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py \
-    --input-root /mnt/jfs/loras_combine/flux_0321_dual_lora \
-    --output-root /mnt/jfs/loras_combine/flux0321_dual_lora_see \
+    --input-root /mnt/jfs/loras_combine/illustrious_0323_dual_lora_diverse \
+    --output-root /mnt/jfs/loras_combine/illustrious_dual_lora_see_diverse \
+    --sample-model-count 100 \
+    --image-subdir eval_images_with_negative_new \
+    --convert-jpg \
+    --jpg-quality 75 \
+    --workers 32
+
+python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py \
+    --input-root /mnt/jfs/loras_combine/illustrious_0323_dual_lora_diverse_unique \
+    --output-root /mnt/jfs/loras_combine/illustrious_0323_dual_lora_diverse_unique_2see \
+    --sample-model-count 200 \
+    --image-subdir eval_images_with_negative_new \
+    --convert-jpg \
+    --jpg-quality 75 \
+    --workers 32
+
+python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py \
+    --input-root /mnt/jfs/loras_combine/illustrious_0323_dual_lora_diverse_no_underline \
+    --output-root /mnt/jfs/loras_combine/illustrious_dual_lora_see_diverse_no_underline \
+    --sample-model-count 100 \
+    --image-subdir eval_images_with_negative_new \
+    --convert-jpg \
+    --jpg-quality 75 \
+    --workers 32
+
+python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py \
+    --input-root /mnt/jfs/loras_combine/flux_0323_dual_lora_diverse \
+    --output-root /mnt/jfs/loras_combine/flux_dual_lora_see_diverse0323 \
+    --sample-model-count 400 \
+    --image-subdir eval_images_with_negative_new \
+    --convert-jpg \
+    --jpg-quality 75 \
+    --workers 32
+
+python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py \
+    --input-root /mnt/jfs/loras_combine/flux_0323_dual_lora_diverse_save_prompt \
+    --output-root /mnt/jfs/loras_combine/flux_0323_dual_lora_diverse_save_prompt_see \
     --sample-model-count 200 \
     --image-subdir eval_images_with_negative_new \
     --convert-jpg \
     --jpg-quality 75
 """
 import argparse
+import concurrent.futures
 import io
 import json
 import random
 import re
 import shutil
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from PIL import Image
 
 
@@ -48,6 +85,29 @@ def sample_models(model_dirs: List[Path], sample_count: int, seed: int) -> List[
     return sorted(rng.sample(model_dirs, sample_count), key=lambda x: x.name)
 
 
+def _copy_or_convert_one(
+    src_path: str,
+    dst_path: str,
+    convert_jpg: bool,
+    jpg_quality: int,
+) -> Tuple[bool, str]:
+    try:
+        src = Path(src_path)
+        dst = Path(dst_path)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if convert_jpg:
+            with src.open("rb") as src_f:
+                raw = src_f.read()
+            with Image.open(io.BytesIO(raw)) as img:
+                rgb = img.convert("RGB")
+                rgb.save(dst, format="JPEG", quality=int(jpg_quality), optimize=True)
+        else:
+            shutil.copy2(src, dst)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
 def flatten_outputs(
     input_root: Path,
     output_root: Path,
@@ -56,6 +116,7 @@ def flatten_outputs(
     sample_seed: int,
     convert_jpg: bool,
     jpg_quality: int,
+    workers: int,
 ) -> Dict[str, object]:
     if not input_root.is_dir():
         raise RuntimeError(f"input_root 不存在或不是目录: {input_root}")
@@ -70,6 +131,7 @@ def flatten_outputs(
     skipped = 0
     per_slot_count: Dict[str, int] = {}
     selected_ids: List[str] = []
+    tasks: List[Tuple[str, str, bool, int, str, str]] = []
 
     for model_dir in selected_model_dirs:
         model_id = model_dir.name
@@ -84,24 +146,34 @@ def flatten_outputs(
             slot_name = m.group(1)
             ext = m.group(2).lower()
             slot_dir = output_root / slot_name
-            slot_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                if convert_jpg:
-                    dst = slot_dir / f"{model_id}.jpg"
-                    with f.open("rb") as src_f:
-                        raw = src_f.read()
-                    with Image.open(io.BytesIO(raw)) as img:
-                        rgb = img.convert("RGB")
-                        rgb.save(dst, format="JPEG", quality=int(jpg_quality), optimize=True)
-                else:
-                    dst = slot_dir / f"{model_id}.{ext}"
-                    shutil.copy2(f, dst)
-            except Exception as e:
+            dst = slot_dir / (f"{model_id}.jpg" if convert_jpg else f"{model_id}.{ext}")
+            tasks.append((str(f), str(dst), bool(convert_jpg), int(jpg_quality), slot_name, str(f)))
+
+    max_workers = max(1, int(workers))
+    if max_workers == 1:
+        for src, dst, cvt, q, slot_name, src_for_log in tasks:
+            ok, err = _copy_or_convert_one(src, dst, cvt, q)
+            if ok:
+                copied += 1
+                per_slot_count[slot_name] = per_slot_count.get(slot_name, 0) + 1
+            else:
                 skipped += 1
-                print(f"[WARN] skip invalid image: {f} err={e}")
-                continue
-            copied += 1
-            per_slot_count[slot_name] = per_slot_count.get(slot_name, 0) + 1
+                print(f"[WARN] skip invalid image: {src_for_log} err={err}")
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as ex:
+            fut_map = {
+                ex.submit(_copy_or_convert_one, src, dst, cvt, q): (slot_name, src_for_log)
+                for src, dst, cvt, q, slot_name, src_for_log in tasks
+            }
+            for fut in concurrent.futures.as_completed(fut_map):
+                slot_name, src_for_log = fut_map[fut]
+                ok, err = fut.result()
+                if ok:
+                    copied += 1
+                    per_slot_count[slot_name] = per_slot_count.get(slot_name, 0) + 1
+                else:
+                    skipped += 1
+                    print(f"[WARN] skip invalid image: {src_for_log} err={err}")
 
     report = {
         "input_root": str(input_root),
@@ -116,6 +188,7 @@ def flatten_outputs(
         "sample_seed": sample_seed,
         "convert_jpg": bool(convert_jpg),
         "jpg_quality": int(jpg_quality),
+        "workers": max_workers,
         "skipped_file_count": skipped,
     }
     (output_root / "flatten_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -129,6 +202,7 @@ def main():
     parser.add_argument("--image-subdir", default="eval_images_with_negative_new")
     parser.add_argument("--sample-model-count", type=int, default=0, help="随机采样 model 数量；0 表示全量")
     parser.add_argument("--sample-seed", type=int, default=42, help="随机采样种子")
+    parser.add_argument("--workers", type=int, default=32, help="多进程并发数，默认32")
     parser.add_argument("--convert-jpg", action="store_true", help="可选：输出统一转为 JPG")
     parser.add_argument(
         "--jpg-quality",
@@ -148,6 +222,7 @@ def main():
         sample_seed=args.sample_seed,
         convert_jpg=bool(args.convert_jpg),
         jpg_quality=int(args.jpg_quality),
+        workers=int(args.workers),
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

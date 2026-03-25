@@ -1,8 +1,8 @@
 
 while true;do
     brainctl launch --charged-group="maintain" --private-machine=yes \
-        --cpu="64" --gpu="4" --memory="1000000" \
-        --charged-group="buffer" --positive-tags "H100,H200,L40S,H800" \
+        --cpu="128" --gpu="4" --memory="1000000" \
+        --charged-group="buffer" --positive-tags "H100,H200,H800,L40S" \
         --negative-tags gpu-h100-0107.host.platform.shaipower.com \
         --positive-tags gpu-h800-0187.host.platform.shaipower.com \
         --image=hub.i.basemind.com/stepcast/stepcast:openvllm-qwen3vl-0925 \

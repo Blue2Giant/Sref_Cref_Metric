@@ -22,6 +22,34 @@ def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _probe_single_url(url: str, timeout_sec: float) -> Tuple[bool, str]:
+    test_urls = [
+        url.rstrip("/") + "/models",
+        url.rstrip("/") + "/health",
+        url.rstrip("/"),
+    ]
+    for u in test_urls:
+        try:
+            resp = base.requests.get(u, timeout=timeout_sec)
+            if 200 <= int(resp.status_code) < 500:
+                return True, u
+        except Exception:
+            continue
+    return False, ""
+
+
+def probe_endpoints(candidates: List[Tuple[str, str]], timeout_sec: float) -> List[Tuple[str, str]]:
+    ok_eps: List[Tuple[str, str]] = []
+    for m, u in candidates:
+        alive, hit = _probe_single_url(u, timeout_sec=timeout_sec)
+        if alive:
+            log(f"[Host][OK] model={m} url={u} probe={hit}")
+            ok_eps.append((m, u))
+        else:
+            log(f"[Host][DOWN] model={m} url={u}")
+    return ok_eps
+
+
 def read_style_index(path: str) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = {}
     if not os.path.isfile(path):
@@ -105,22 +133,36 @@ def load_existing_done(out_jsonl: str) -> Dict[str, str]:
             if not isinstance(obj, dict):
                 continue
             for k, v in obj.items():
-                if isinstance(k, str) and isinstance(v, str):
+                if not isinstance(k, str):
+                    continue
+                if isinstance(v, list):
+                    out[k] = json.dumps(v, ensure_ascii=False)
+                elif isinstance(v, str):
                     out[k] = v
     return out
 
 
+def decide_matched_paths_output(matched_paths: List[str], match_threshold: int) -> List[str]:
+    if int(match_threshold) < 0:
+        raise ValueError("match_threshold 必须 >= 0")
+    if len(matched_paths) >= int(match_threshold):
+        return list(matched_paths[: int(match_threshold)])
+    return []
+
+
 def _judge_one(task: Dict[str, Any]) -> Dict[str, Any]:
+    """返回每个pair的判别输出：通过时是路径列表，不通过时是空列表。"""
     args = G_ARGS
     pair_key = task["pair_key"]
     main_img = task["main_img"]
     style_imgs = task["style_imgs"]
 
     if not base.smart_exists(main_img):
-        return {"pair_key": pair_key, "value": "", "error": f"main_not_found: {main_img}"}
+        return {"pair_key": pair_key, "value": [], "error": f"main_not_found: {main_img}"}
     if not style_imgs:
-        return {"pair_key": pair_key, "value": "", "error": f"style_id_not_found: {task['style_id']}"}
+        return {"pair_key": pair_key, "value": [], "error": f"style_id_not_found: {task['style_id']}"}
 
+    matched_paths: List[str] = []
     for sp in style_imgs:
         if not base.smart_exists(sp):
             continue
@@ -134,11 +176,13 @@ def _judge_one(task: Dict[str, Any]) -> Dict[str, Any]:
             min_true=int(args.style_min_true),
         )
         if retry_exhausted:
-            return {"pair_key": pair_key, "value": "", "error": "retry_exhausted"}
+            return {"pair_key": pair_key, "value": [], "error": "retry_exhausted"}
         if decision is True:
-            return {"pair_key": pair_key, "value": sp, "error": ""}
+            matched_paths.append(sp)
 
-    return {"pair_key": pair_key, "value": "", "error": ""}
+    # 阈值判断：只有命中数量达到阈值，才输出对应数量的style路径
+    out_value = decide_matched_paths_output(matched_paths, int(args.match_threshold))
+    return {"pair_key": pair_key, "value": out_value, "error": ""}
 
 
 def _worker(model: str, base_url: str, tasks: List[Dict[str, Any]], result_queue: mp.Queue, args_obj: Any):
@@ -151,11 +195,11 @@ def _worker(model: str, base_url: str, tasks: List[Dict[str, Any]], result_queue
         try:
             result_queue.put(_judge_one(task))
         except Exception as e:
-            result_queue.put({"pair_key": task.get("pair_key", ""), "value": "", "error": f"worker_exception: {e}"})
+            result_queue.put({"pair_key": task.get("pair_key", ""), "value": [], "error": f"worker_exception: {e}"})
 
 
 def main():
-    parser = argparse.ArgumentParser("风格首个命中判别：命中任一style图即输出该路径，否则输出空字符串")
+    parser = argparse.ArgumentParser("风格阈值命中判别：命中数量达到阈值才输出style路径列表")
     parser.add_argument("--triplet-jsonl", required=True)
     parser.add_argument("--style-index-jsonl", required=True)
     parser.add_argument("--out-jsonl", required=True)
@@ -165,15 +209,19 @@ def main():
     parser.add_argument("--style_conf_thr", type=float, default=0.5)
     parser.add_argument("--style_judge_times", type=int, default=3)
     parser.add_argument("--style_min_true", type=int, default=3)
+    parser.add_argument("--match_threshold", type=int, default=1, help="至少命中多少张style图才视为通过，默认1")
     parser.add_argument("--model", type=str, default=base.MODEL)
     parser.add_argument("--base_url", type=str, default=base.BASE_URL)
     parser.add_argument("--endpoint", action="append", default=[])
     parser.add_argument("--procs_per_endpoint", type=int, default=1)
     parser.add_argument("--conn_retry_times", type=int, default=5)
     parser.add_argument("--conn_retry_delay", type=float, default=2.0)
+    parser.add_argument("--probe-timeout", type=float, default=3.0)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--flush-every", type=int, default=1)
     args = parser.parse_args()
+    if int(args.match_threshold) < 0:
+        raise RuntimeError("--match_threshold 必须 >= 0")
 
     style_index = read_style_index(args.style_index_jsonl)
     tasks, skipped_parse = parse_triplet_jsonl(args.triplet_jsonl, style_index)
@@ -205,6 +253,13 @@ def main():
             endpoints.append((args.model, s))
     if not endpoints:
         endpoints = [(args.model, args.base_url)]
+    log("[Host] candidates:")
+    for m, u in endpoints:
+        log(f"[Host] candidate model={m} url={u}")
+    endpoints = probe_endpoints(endpoints, timeout_sec=max(0.5, float(args.probe_timeout)))
+    if not endpoints:
+        raise RuntimeError("没有可用endpoint，探测全部失败")
+    log(f"[Host] available={len(endpoints)}")
 
     pp = max(1, int(args.procs_per_endpoint))
     worker_specs: List[Tuple[str, str]] = []
@@ -252,12 +307,13 @@ def main():
                         continue
                     break
                 pair_key = rec.get("pair_key", "")
-                value = rec.get("value", "")
+                value = rec.get("value", [])
                 err = rec.get("error", "")
                 if pair_key:
-                    fout.write(json.dumps({pair_key: value if isinstance(value, str) else ""}, ensure_ascii=False) + "\n")
+                    out_val = value if isinstance(value, list) else []
+                    fout.write(json.dumps({pair_key: out_val}, ensure_ascii=False) + "\n")
                     ok += 1
-                    if isinstance(value, str) and value:
+                    if isinstance(out_val, list) and len(out_val) > 0:
                         matched += 1
                 if err and ferr is not None:
                     ferr.write(json.dumps(rec, ensure_ascii=False) + "\n")

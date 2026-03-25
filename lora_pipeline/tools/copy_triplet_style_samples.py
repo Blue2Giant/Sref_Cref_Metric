@@ -21,6 +21,14 @@ python /data/benchmark_metrics/lora_pipeline/tools/copy_triplet_style_samples.py
   --result-label 1 \
   --jpg-quality 78 \
   --overwrite
+
+python /data/benchmark_metrics/lora_pipeline/tools/copy_triplet_style_samples.py \
+  --binary-jsonl /data/benchmark_metrics/logs/triplet_style_firsthit_judge_0325_0.5_2/style_firsthit.jsonl \
+  --output-root /mnt/jfs/lora_combine/triplet_style_copy_debug_firsthit_0325_0.5_2 \
+  --sample-count 600 \
+  --result-label 1 \
+  --jpg-quality 78 \
+  --overwrite
 """
 import argparse
 import concurrent.futures
@@ -211,6 +219,42 @@ def build_samples(
     return records, stats
 
 
+def sample_diverse_with_seed(samples: List[SampleRecord], sample_count: int, seed: int) -> List[SampleRecord]:
+    if sample_count <= 0 or sample_count >= len(samples):
+        return list(samples)
+    rng = random.Random(int(seed))
+    buckets: Dict[str, List[SampleRecord]] = {}
+    for rec in samples:
+        if "__" in rec.pair_key:
+            _cid, sid = rec.pair_key.split("__", 1)
+            group = sid.strip() or "unknown"
+        else:
+            group = "unknown"
+        buckets.setdefault(group, []).append(rec)
+    for k in buckets:
+        rng.shuffle(buckets[k])
+    groups = list(buckets.keys())
+    rng.shuffle(groups)
+
+    out: List[SampleRecord] = []
+    idx_map = {g: 0 for g in groups}
+    active = list(groups)
+    while len(out) < sample_count and active:
+        next_active = []
+        for g in active:
+            i = idx_map[g]
+            arr = buckets[g]
+            if i < len(arr):
+                out.append(arr[i])
+                idx_map[g] = i + 1
+                if idx_map[g] < len(arr):
+                    next_active.append(g)
+                if len(out) >= sample_count:
+                    break
+        active = next_active
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description="按风格判别结果抽样并拷贝triplet/style图片到观察目录（转JPG）")
     parser.add_argument("--binary-jsonl", default="/data/benchmark_metrics/logs/triplet_style_index_judge_0324/style_binary.jsonl")
@@ -240,9 +284,7 @@ def main():
     if not samples:
         raise RuntimeError("筛选后没有可处理样本")
 
-    rng = random.Random(args.seed)
-    if args.sample_count > 0 and args.sample_count < len(samples):
-        samples = rng.sample(samples, args.sample_count)
+    samples = sample_diverse_with_seed(samples, int(args.sample_count), int(args.seed))
 
     os.makedirs(args.output_root, exist_ok=True)
 

@@ -38,8 +38,8 @@ python /data/benchmark_metrics/lora_pipeline/tools/copy_one_lora_2see_flat.py \
 
 python /data/benchmark_metrics/lora_pipeline/tools/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_flux_debug_1226 \
-  --one-lora-root /mnt/jfs/loras_combine/flux_0321_one_lora \
-  --out-root /mnt/jfs/loras_combine/flux_merged_eval_compare_flat_style_0321_all_new \
+  --one-lora-root /mnt/jfs/loras_combine/flux_0326_one_lora \
+  --out-root /mnt/jfs/loras_combine/flux_merged_eval_compare_flat_style_0326_all_new \
   --eval-subfolder eval_images_with_negative/ \
   --one-subfolder eval_images_with_negative_new \
   --only-model-ids /data/benchmark_metrics/lora_pipeline/meta/model_ids/flux_style_1.txt \
@@ -47,9 +47,22 @@ python /data/benchmark_metrics/lora_pipeline/tools/copy_one_lora_2see_flat.py \
   --limit-one-per-model 4 \
   --convert-jpg \
   --jpg-quality 75 \
-  --limit-model-count 0 \
+  --limit-model-count 400 \
   --workers 128
 
+python /data/benchmark_metrics/lora_pipeline/tools/copy_one_lora_2see_flat.py \
+  --eval-root s3://lanjinghong-data/loras_eval_flux_debug_1226 \
+  --one-lora-root /mnt/jfs/loras_combine/flux_0326_one_lora \
+  --out-root /mnt/jfs/loras_combine/flux_merged_eval_compare_flat_content_0326_all_new \
+  --eval-subfolder eval_images_with_negative/ \
+  --one-subfolder eval_images_with_negative_new \
+  --only-model-ids /data/benchmark_metrics/lora_pipeline/meta/model_ids/flux_content_sample.txt \
+  --limit-eval-per-model 10 \
+  --limit-one-per-model 10 \
+  --convert-jpg \
+  --jpg-quality 75 \
+  --limit-model-count 400 \
+  --workers 128
 
 python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_illustrious_one_img_magic \

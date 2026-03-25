@@ -60,6 +60,15 @@ python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py 
     --image-subdir eval_images_with_negative_new \
     --convert-jpg \
     --jpg-quality 75
+
+python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py \
+    --input-root /mnt/jfs/loras_combine/qwen_0323_dual_lora \
+    --output-root /mnt/jfs/loras_combine/qwen_0323_dual_lora0326 \
+    --sample-model-count 400 \
+    --image-subdir eval_images_with_negative_new \
+    --convert-jpg \
+    --jpg-quality 75 \
+    --workers 32
 """
 import argparse
 import concurrent.futures

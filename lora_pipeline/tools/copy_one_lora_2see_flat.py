@@ -3,13 +3,14 @@
 """
 python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_illustrious_one_img_magic \
-  --one-lora-root /mnt/jfs/loras_combine/illustrious_0318_one_lora \
-  --out-root /mnt/jfs/loras_combine/illustrious_merged_eval_compare_illustrious_flat_v4a \
+  --one-lora-root output_root=/mnt/jfs/loras_combine/illustrious_0321_two_lora  \
+  --out-root /mnt/jfs/loras_combine/illustrious_0321_two_lora_600 \
   --eval-subfolder eval_images_with_negative_new \
   --one-subfolder eval_images_with_negative_new \
   --only-model-ids /data/LoraPipeline/assets/illustrious_content_sample_final.txt \
-  --limit-eval-per-model 4 \
-  --limit-one-per-model 4
+  --limit-eval-per-model 10 \
+  --limit-one-per-model 10
+
 
 python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_qwen \

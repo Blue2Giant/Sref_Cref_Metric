@@ -57,29 +57,49 @@ def _build_latest_lora_map(lora_root: str) -> Dict[str, str]:
     return out
 
 
-def _compose_prompt_dual(prompt: str, content_trigger: str, style_trigger: str, prefix_phrase: str) -> str:
+def _compose_prompt_dual(
+    prompt: str,
+    content_trigger: str,
+    style_trigger: str,
+    prefix_phrase: str,
+    allow_empty_prompt_body: bool = False,
+) -> str:
     body = (prompt or "").strip()
-    if not body:
-        return ""
     heads: List[str] = []
     ct = (content_trigger or "").strip()
     st = (style_trigger or "").strip()
     pp = (prefix_phrase or "").strip()
-    if ct and not base._contains_phrase(body, ct):
+    if ct and (not body or not base._contains_phrase(body, ct)):
         heads.append(ct)
-    if st and not base._contains_phrase(body, st):
+    if st and (not body or not base._contains_phrase(body, st)):
         heads.append(st)
-    if pp and not base._contains_phrase(body, pp):
+    if pp and (not body or not base._contains_phrase(body, pp)):
         heads.append(pp)
+    if not body:
+        if allow_empty_prompt_body:
+            return ", ".join(heads)
+        return ""
     if not heads:
         return body
     return f"{', '.join(heads)}, {body}"
 
 
-def _attach_dual_triggers(prompts: List[str], content_trigger: str, style_trigger: str, prefix_phrase: str) -> List[str]:
+def _attach_dual_triggers(
+    prompts: List[str],
+    content_trigger: str,
+    style_trigger: str,
+    prefix_phrase: str,
+    allow_empty_prompt_body: bool = False,
+) -> List[str]:
     out: List[str] = []
     for p in prompts:
-        q = _compose_prompt_dual(p, content_trigger, style_trigger, prefix_phrase)
+        q = _compose_prompt_dual(
+            p,
+            content_trigger,
+            style_trigger,
+            prefix_phrase,
+            allow_empty_prompt_body=allow_empty_prompt_body,
+        )
         if q:
             out.append(q)
     return out
@@ -276,6 +296,7 @@ def process_one_pair(
     prefix_phrase: str,
     negative_prompt: str,
     download_workers: int,
+    allow_empty_prompt_body: bool,
 ):
     pair_id = f"{content_model_id}__{style_model_id}"
     model_output_dir = base.join_path(output_root, pair_id)
@@ -292,19 +313,32 @@ def process_one_pair(
         style_trigger, _ = base.parse_trigger_from_meta(style_model_id, meta_root, meta_index)
         style_trigger = (style_trigger or "").strip()
 
-    all_prompts = base.load_prompts_from_txt(base_prompt_txt_local)
     base.safe_makedirs(eval_dir)
-    selected_base_prompts = base.select_diverse_prompts_for_model(
-        model_id=pair_id,
-        all_prompts=all_prompts,
-        num_prompts=num_prompts_to_gen,
-        prompt_seed=prompt_seed,
-        trigger_word=f"{content_trigger} {style_trigger}".strip(),
-        prefix_phrase=prefix_phrase,
-        eval_dir=eval_dir,
-        overwrite=overwrite,
+    all_prompts = []
+    if base_prompt_txt_local and os.path.isfile(base_prompt_txt_local):
+        all_prompts = base.load_prompts_from_txt(base_prompt_txt_local)
+    if all_prompts:
+        selected_base_prompts = base.select_diverse_prompts_for_model(
+            model_id=pair_id,
+            all_prompts=all_prompts,
+            num_prompts=num_prompts_to_gen,
+            prompt_seed=prompt_seed,
+            trigger_word=f"{content_trigger} {style_trigger}".strip(),
+            prefix_phrase=prefix_phrase,
+            eval_dir=eval_dir,
+            overwrite=overwrite,
+        )
+    elif allow_empty_prompt_body:
+        selected_base_prompts = [""] * max(1, int(num_prompts_to_gen))
+    else:
+        raise RuntimeError("prompt 为空且未开启 --allow-empty-prompt-body")
+    selected_prompts = _attach_dual_triggers(
+        selected_base_prompts,
+        content_trigger,
+        style_trigger,
+        prefix_phrase,
+        allow_empty_prompt_body=allow_empty_prompt_body,
     )
-    selected_prompts = _attach_dual_triggers(selected_base_prompts, content_trigger, style_trigger, prefix_phrase)
     prompt_record_path = base.join_path(model_output_dir, "selected_prompts_final.json")
     base._write_json(
         prompt_record_path,
@@ -384,6 +418,7 @@ def main():
     parser.add_argument("--download-retry-rounds", type=int, default=2)
     parser.add_argument("--download-retry-wait", type=float, default=2.0)
     parser.add_argument("--download-workers", type=int, default=1)
+    parser.add_argument("--allow-empty-prompt-body", action="store_true")
     args = parser.parse_args()
 
     os.makedirs(args.local_tmp_root, exist_ok=True)
@@ -457,6 +492,7 @@ def main():
                 args.prefix_phrase,
                 args.negative_prompt,
                 args.download_workers,
+                args.allow_empty_prompt_body,
             ): f"{pair[0][0]}__{pair[0][1]}"
             for pair in pair_tasks
         }

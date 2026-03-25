@@ -1,9 +1,9 @@
 """
 展平双lora的结果
 python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py \
-    --input-root /mnt/jfs/loras_combine/illustrious_0323_dual_lora \
-    --output-root /mnt/jfs/loras_combine/illustrious_dual_lora_see \
-    --sample-model-count 200 \
+    --input-root output_root=/mnt/jfs/loras_combine/illustrious_0321_two_lora \
+    --output-root /mnt/jfs/loras_combine/illustrious_one_lora_2_see \
+    --sample-model-count 600 \
     --image-subdir eval_images_with_negative_new \
     --convert-jpg \
     --jpg-quality 75
@@ -21,6 +21,15 @@ python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py 
     --input-root /mnt/jfs/loras_combine/illustrious_0323_dual_lora_diverse_unique \
     --output-root /mnt/jfs/loras_combine/illustrious_0323_dual_lora_diverse_unique_2see \
     --sample-model-count 200 \
+    --image-subdir eval_images_with_negative_new \
+    --convert-jpg \
+    --jpg-quality 75 \
+    --workers 32
+
+python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py \
+    --input-root /mnt/jfs/loras_combine/illustrious_0323_dual_lora_diverse_unique \
+    --output-root /mnt/jfs/loras_combine/illustrious_0323_dual_lora_diverse_unique_2see \
+    --sample-model-count 600 \
     --image-subdir eval_images_with_negative_new \
     --convert-jpg \
     --jpg-quality 75 \
@@ -46,8 +55,8 @@ python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py 
 
 python /data/benchmark_metrics/lora_pipeline/tools/flatten_dual_lora_outputs.py \
     --input-root /mnt/jfs/loras_combine/flux_0323_dual_lora_diverse_save_prompt \
-    --output-root /mnt/jfs/loras_combine/flux_0323_dual_lora_diverse_save_prompt_see \
-    --sample-model-count 200 \
+    --output-root /mnt/jfs/loras_combine/flux_0323_dual_lora_diverse_save_prompt_see_0324 \
+    --sample-model-count 400 \
     --image-subdir eval_images_with_negative_new \
     --convert-jpg \
     --jpg-quality 75

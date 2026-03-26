@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+from matplotlib import colors as mcolors
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -36,6 +37,13 @@ def parse_args():
     parser.add_argument("--image-dpi", type=int, default=120)
     parser.add_argument("--save-format", choices=["png", "pdf"], default="png")
     parser.add_argument("--ref-labels", default="cref,sref", help="参考图名称，逗号分隔，按输入图顺序")
+    parser.add_argument("--attn-cmap", default="turbo", help="attention强度色图")
+    parser.add_argument("--attn-gamma", type=float, default=0.5, help="attention强度gamma增强，越小越强调高值")
+    parser.add_argument("--high-attn-quantile", type=float, default=0.9, help="高注意力区域分位数阈值")
+    parser.add_argument("--high-attn-contour-color", default="#00e5ff", help="高注意力区域轮廓线颜色")
+    parser.add_argument("--high-attn-contour-width", type=float, default=0.8, help="高注意力区域轮廓线宽")
+    parser.add_argument("--region-alpha", type=float, default=0.18, help="参考图分区底色透明度")
+    parser.add_argument("--boundary-linewidth", type=float, default=2.0, help="参考图分界线宽度")
     return parser.parse_args()
 
 
@@ -73,6 +81,7 @@ class AttentionCollector:
         self.max_tokens = max(1, int(max_tokens))
         self.handles = []
         self.maps: Dict[int, torch.Tensor] = {}
+        self.meta: Dict[int, Dict[str, object]] = {}
 
     def _sample_tokens(self, n: int) -> torch.Tensor:
         if n <= self.max_tokens:
@@ -108,6 +117,13 @@ class AttentionCollector:
                 k_idx = self._sample_tokens(attn.shape[2])
                 attn = attn[:, q_idx][:, :, k_idx]
                 self.maps[block_idx] = attn
+                self.meta[block_idx] = {
+                    "has_encoder": bool(torch.is_tensor(encoder_hidden_states)),
+                    "q_tokens_full": int(qn),
+                    "k_tokens_full": int(kn),
+                    "q_sample_indices": q_idx.tolist(),
+                    "k_sample_indices": k_idx.tolist(),
+                }
             except Exception:
                 return
         return _fn
@@ -143,6 +159,57 @@ def build_ref_ranges(total_len: int, num_refs: int) -> List[Tuple[int, int, int]
     return out
 
 
+def build_ref_ticks(ranges: List[Tuple[int, int, int]], labels: List[str], prefix: str) -> Tuple[List[float], List[str]]:
+    ticks: List[float] = []
+    texts: List[str] = []
+    for ridx, start, end in ranges:
+        if end <= start or ridx >= len(labels):
+            continue
+        ticks.append((start + end - 1) * 0.5)
+        texts.append(f"{prefix}:{labels[ridx]} [{start}-{end - 1}]")
+    return ticks, texts
+
+
+def build_axis_layout(
+    full_len: int,
+    sample_indices: List[int],
+    labels: List[str],
+    prefix: str,
+) -> Tuple[List[float], List[str], List[int]]:
+    num_refs = len(labels)
+    if num_refs <= 0:
+        return [], [], []
+    n_sample = len(sample_indices)
+    if n_sample <= 0:
+        return [], [], []
+    full_ranges = build_ref_ranges(max(int(full_len), 1), num_refs)
+    arr = np.asarray(sample_indices, dtype=np.int64)
+    sample_ranges: List[Tuple[int, int, int, int, int]] = []
+    for ridx, fs, fe in full_ranges:
+        if fe <= fs:
+            continue
+        loc = np.where((arr >= fs) & (arr < fe))[0]
+        if loc.size <= 0:
+            continue
+        ss = int(loc.min())
+        se = int(loc.max()) + 1
+        sample_ranges.append((ridx, ss, se, fs, fe))
+    if not sample_ranges:
+        fallback = build_ref_ranges(n_sample, num_refs)
+        sample_ranges = [(ridx, ss, se, ss, se) for ridx, ss, se in fallback if se > ss]
+    ticks: List[float] = []
+    tick_labels: List[str] = []
+    boundaries: List[int] = []
+    for i, (ridx, ss, se, fs, fe) in enumerate(sample_ranges):
+        if ridx >= len(labels) or se <= ss:
+            continue
+        ticks.append((ss + se - 1) * 0.5)
+        tick_labels.append(f"{prefix}:{labels[ridx]} [{fs}-{fe - 1}]")
+        if i < len(sample_ranges) - 1:
+            boundaries.append(se)
+    return ticks, tick_labels, boundaries
+
+
 def aggregate_full_map(attn_maps: Dict[int, torch.Tensor], head_mode: str, block_mode: str) -> torch.Tensor:
     if len(attn_maps) == 0:
         raise RuntimeError("没有收集到attention map")
@@ -176,6 +243,79 @@ def aggregate_head_map(attn: torch.Tensor, head_mode: str) -> torch.Tensor:
     return attn.mean(dim=0)
 
 
+def build_high_mask_overlay(arr: np.ndarray, thr: float, color_hex: str, alpha: float) -> np.ndarray:
+    h, w = arr.shape
+    rgba = np.zeros((h, w, 4), dtype=np.float32)
+    mask = arr >= float(thr)
+    if not np.any(mask):
+        return rgba
+    rgb = np.array(mcolors.to_rgb(color_hex), dtype=np.float32)
+    rgba[mask, 0] = rgb[0]
+    rgba[mask, 1] = rgb[1]
+    rgba[mask, 2] = rgb[2]
+    rgba[mask, 3] = float(alpha)
+    return rgba
+
+
+def save_token_layout_summary(
+    out_path: Path,
+    key: str,
+    prompt: str,
+    ref_labels: List[str],
+    collector: AttentionCollector,
+    sample_block: int,
+    step_block_maps: Dict[int, Dict[int, torch.Tensor]],
+    tokenizer=None,
+):
+    meta = collector.meta.get(sample_block, {})
+    q_full = int(meta.get("q_tokens_full", 0))
+    k_full = int(meta.get("k_tokens_full", 0))
+    has_encoder = bool(meta.get("has_encoder", False))
+    q_sample = [int(x) for x in meta.get("q_sample_indices", [])]
+    k_sample = [int(x) for x in meta.get("k_sample_indices", [])]
+    q_text = "[]"
+    k_text = "[]"
+    q_non_text = "[]"
+    k_non_text = "[]"
+    text_tokens_est = 0
+    if tokenizer is not None:
+        try:
+            text_tokens_est = int(tokenizer(prompt, return_tensors="pt").input_ids.shape[1])
+        except Exception:
+            text_tokens_est = 0
+    if q_full > 0:
+        q_non_text = f"[0-{q_full - 1}]"
+    if has_encoder and k_full > 0:
+        text_end = min(max(text_tokens_est - 1, -1), k_full - 1)
+        if text_end >= 0:
+            k_text = f"[0-{text_end}]"
+            if text_end + 1 <= k_full - 1:
+                k_non_text = f"[{text_end + 1}-{k_full - 1}]"
+        else:
+            k_non_text = f"[0-{k_full - 1}]"
+    elif k_full > 0:
+        k_non_text = f"[0-{k_full - 1}]"
+    lines = [
+        f"key={key}",
+        f"sample_block={sample_block}",
+        f"head_aggregation=mean_or_max_by_arg",
+        f"q_source=hidden_states(latent/noise)",
+        f"k_source={'encoder_hidden_states(cond: text+image/ref)' if has_encoder else 'hidden_states(latent/noise)'}",
+        f"q_tokens_full={q_full}",
+        f"k_tokens_full={k_full}",
+        f"text_tokens_estimated={text_tokens_est}",
+        f"q_text_range={q_text}",
+        f"q_non_text_range={q_non_text}",
+        f"k_text_range_estimated={k_text}",
+        f"k_non_text_range_estimated={k_non_text}",
+        f"q_sampled_indices={q_sample}",
+        f"k_sampled_indices={k_sample}",
+        f"ref_labels={ref_labels}",
+    ]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def save_step_block_grid(
     step_block_maps: Dict[int, Dict[int, torch.Tensor]],
     out_path: Path,
@@ -186,6 +326,17 @@ def save_step_block_grid(
     step_stride: int,
     block_stride: int,
     panel_size: float,
+    attn_cmap: str,
+    attn_gamma: float,
+    high_attn_quantile: float,
+    high_attn_contour_color: str,
+    high_attn_contour_width: float,
+    region_alpha: float,
+    boundary_linewidth: float,
+    q_tokens_full: int = 0,
+    k_tokens_full: int = 0,
+    q_sample_indices: List[int] = None,
+    k_sample_indices: List[int] = None,
 ):
     if len(step_block_maps) == 0:
         raise RuntimeError("没有可用的step-block attention")
@@ -195,9 +346,12 @@ def save_step_block_grid(
         raise RuntimeError("没有可用的block attention")
 
     sample = step_block_maps[steps[0]][block_ids[0]]
-    q_ranges = build_ref_ranges(int(sample.shape[0]), len(ref_labels))
-    k_ranges = build_ref_ranges(int(sample.shape[1]), len(ref_labels))
-    colors = plt.cm.get_cmap("tab20", max(1, len(ref_labels)))
+    q_indices = [int(x) for x in (q_sample_indices or list(range(int(sample.shape[0]))))]
+    k_indices = [int(x) for x in (k_sample_indices or list(range(int(sample.shape[1]))))]
+    q_full = int(q_tokens_full) if int(q_tokens_full) > 0 else int(sample.shape[0])
+    k_full = int(k_tokens_full) if int(k_tokens_full) > 0 else int(sample.shape[1])
+    y_ticks, y_labels, q_boundaries = build_axis_layout(q_full, q_indices, ref_labels, "Q")
+    x_ticks, x_labels, k_boundaries = build_axis_layout(k_full, k_indices, ref_labels, "K")
 
     all_vals = []
     for s in steps:
@@ -205,13 +359,19 @@ def save_step_block_grid(
             x = step_block_maps[s].get(b)
             if x is not None:
                 all_vals.append(x)
-    vmin = min(float(x.min().item()) for x in all_vals)
-    vmax = max(float(x.max().item()) for x in all_vals)
+    all_flat = torch.cat([x.reshape(-1) for x in all_vals], dim=0)
+    vmin = float(torch.quantile(all_flat, 0.02).item())
+    vmax = float(torch.quantile(all_flat, 0.995).item())
+    if vmax <= vmin:
+        vmax = float(all_flat.max().item())
+        vmin = float(all_flat.min().item())
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
+    norm = mcolors.PowerNorm(gamma=max(float(attn_gamma), 1e-3), vmin=vmin, vmax=vmax)
     panel_size = max(0.8, float(panel_size))
     fig_w = max(10.0, len(block_ids) * panel_size)
     fig_h = max(8.0, len(steps) * panel_size)
     fig, axes = plt.subplots(len(steps), len(block_ids), figsize=(fig_w, fig_h), squeeze=False)
-    im = None
     for ridx, step in enumerate(steps):
         for cidx, block_id in enumerate(block_ids):
             ax = axes[ridx][cidx]
@@ -219,37 +379,35 @@ def save_step_block_grid(
             if mat is None:
                 ax.axis("off")
                 continue
-            im = ax.imshow(mat.numpy(), aspect="auto", cmap="viridis", vmin=vmin, vmax=vmax)
-            for rr, qs, qe in q_ranges:
-                if qe > qs:
-                    ax.axhspan(qs, qe - 1, alpha=0.08, color=colors(rr))
-            for rr, ks, ke in k_ranges:
-                if ke > ks:
-                    ax.axvspan(ks, ke - 1, alpha=0.08, color=colors(rr))
-            ax.set_xticks([])
-            ax.set_yticks([])
-            if ridx == 0:
-                ax.set_title(f"B{block_id}", fontsize=8)
-            if cidx == 0:
-                ax.set_ylabel(f"S{step}", fontsize=8)
-
-    handles = []
-    for ridx, (qs, qe), (ks, ke) in zip(range(len(ref_labels)), [(x[1], x[2]) for x in q_ranges], [(x[1], x[2]) for x in k_ranges]):
-        handles.append(
-            mpatches.Patch(
-                color=colors(ridx),
-                label=f"{ref_labels[ridx]} Q[{qs},{max(qs, qe-1)}] K[{ks},{max(ks, ke-1)}]",
-            )
-        )
-    if handles:
-        fig.legend(handles=handles, loc="upper center", ncol=min(4, len(handles)), fontsize=8)
-    if im is not None:
-        fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.012, pad=0.01)
+            mat_np = mat.numpy()
+            ax.imshow(mat_np, aspect="auto", cmap=attn_cmap, norm=norm)
+            q_thr = float(torch.quantile(mat.reshape(-1), min(max(float(high_attn_quantile), 0.5), 0.999)).item())
+            overlay_alpha = min(max(0.18 + 0.08 * float(high_attn_contour_width), 0.12), 0.55)
+            high_overlay = build_high_mask_overlay(mat_np, q_thr, high_attn_contour_color, overlay_alpha)
+            ax.imshow(high_overlay, aspect="auto", interpolation="nearest")
+            for y in q_boundaries:
+                ax.axhline(y - 0.5, color="#d8d8d8", linewidth=max(float(boundary_linewidth), 0.8) * 0.5, alpha=0.65)
+            for x in k_boundaries:
+                ax.axvline(x - 0.5, color="#d8d8d8", linewidth=max(float(boundary_linewidth), 0.8) * 0.5, alpha=0.65)
+            if ridx == len(steps) - 1 and x_ticks:
+                ax.set_xticks(x_ticks)
+                ax.set_xticklabels(x_labels, rotation=24, ha="right", fontsize=7)
+            else:
+                ax.set_xticks([])
+            if cidx == 0 and y_ticks:
+                ax.set_yticks(y_ticks)
+                ax.set_yticklabels(y_labels, fontsize=7)
+            else:
+                ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_visible(True)
+                sp.set_color("black")
+                sp.set_linewidth(0.8)
     fig.suptitle(
         f"Attention Grid (rows=step stride {step_stride}, cols=block stride {block_stride}, head={head_mode})",
         fontsize=11,
     )
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.subplots_adjust(left=0.03, right=0.997, top=0.96, bottom=0.08, wspace=0.0, hspace=0.0)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=image_dpi, bbox_inches="tight", format=save_format)
     plt.close(fig)
@@ -263,54 +421,51 @@ def save_full_map(
     save_format: str,
     head_mode: str,
     block_mode: str,
+    attn_cmap: str,
+    attn_gamma: float,
+    high_attn_quantile: float,
+    high_attn_contour_color: str,
+    high_attn_contour_width: float,
+    region_alpha: float,
+    boundary_linewidth: float,
 ):
     q_len = int(full_map.shape[0])
     k_len = int(full_map.shape[1])
     num_refs = len(ref_labels)
     q_ranges = build_ref_ranges(q_len, num_refs)
     k_ranges = build_ref_ranges(k_len, num_refs)
-    colors = plt.cm.get_cmap("tab20", max(1, num_refs))
+    x_ticks, x_labels = build_ref_ticks(k_ranges, ref_labels, "K")
+    y_ticks, y_labels = build_ref_ticks(q_ranges, ref_labels, "Q")
+    flat = full_map.reshape(-1)
+    vmin = float(torch.quantile(flat, 0.02).item())
+    vmax = float(torch.quantile(flat, 0.995).item())
+    if vmax <= vmin:
+        vmax = float(flat.max().item())
+        vmin = float(flat.min().item())
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
+    norm = mcolors.PowerNorm(gamma=max(float(attn_gamma), 1e-3), vmin=vmin, vmax=vmax)
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    im = ax.imshow(full_map.numpy(), aspect="auto", cmap="viridis")
-    for ridx, qs, qe in q_ranges:
-        if qe > qs:
-            ax.axhspan(qs, qe - 1, alpha=0.12, color=colors(ridx))
-    for ridx, ks, ke in k_ranges:
-        if ke > ks:
-            ax.axvspan(ks, ke - 1, alpha=0.12, color=colors(ridx))
-    xticks = []
-    xlabels = []
-    yticks = []
-    ylabels = []
-    for ridx, ks, ke in k_ranges:
-        if ke > ks:
-            xticks.append((ks + ke - 1) * 0.5)
-            xlabels.append(f"K:{ref_labels[ridx]}")
-    for ridx, qs, qe in q_ranges:
-        if qe > qs:
-            yticks.append((qs + qe - 1) * 0.5)
-            ylabels.append(f"Q:{ref_labels[ridx]}")
-    if xticks:
-        ax.set_xticks(xticks)
-        ax.set_xticklabels(xlabels, rotation=20, ha="right", fontsize=8)
-    if yticks:
-        ax.set_yticks(yticks)
-        ax.set_yticklabels(ylabels, fontsize=8)
-    handles = []
-    for ridx, (qs, qe), (ks, ke) in zip(range(len(ref_labels)), [(x[1], x[2]) for x in q_ranges], [(x[1], x[2]) for x in k_ranges]):
-        handles.append(
-            mpatches.Patch(
-                color=colors(ridx),
-                label=f"{ref_labels[ridx]} Q[{qs},{max(qs, qe-1)}] K[{ks},{max(ks, ke-1)}]",
-            )
-        )
-    if handles:
-        ax.legend(handles=handles, loc="upper right", fontsize=8)
+    full_np = full_map.numpy()
+    ax.imshow(full_np, aspect="auto", cmap=attn_cmap, norm=norm)
+    q_thr = float(torch.quantile(flat, min(max(float(high_attn_quantile), 0.5), 0.999)).item())
+    overlay_alpha = min(max(0.18 + 0.08 * float(high_attn_contour_width), 0.12), 0.55)
+    high_overlay = build_high_mask_overlay(full_np, q_thr, high_attn_contour_color, overlay_alpha)
+    ax.imshow(high_overlay, aspect="auto", interpolation="nearest")
+    for _, qs, _ in q_ranges[1:]:
+        ax.axhline(qs - 0.5, color="#d8d8d8", linewidth=max(float(boundary_linewidth), 0.8) * 0.55, alpha=0.65)
+    for _, ks, _ in k_ranges[1:]:
+        ax.axvline(ks - 0.5, color="#d8d8d8", linewidth=max(float(boundary_linewidth), 0.8) * 0.55, alpha=0.65)
+    if x_ticks:
+        ax.set_xticks(x_ticks)
+        ax.set_xticklabels(x_labels, rotation=20, ha="right", fontsize=8)
+    if y_ticks:
+        ax.set_yticks(y_ticks)
+        ax.set_yticklabels(y_labels, fontsize=8)
     ax.set_title(f"Full Attention Map (head={head_mode}, block={block_mode})")
     ax.set_xlabel("key tokens")
     ax.set_ylabel("query tokens")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=image_dpi, bbox_inches="tight", format=save_format)
     plt.close(fig)
@@ -418,10 +573,37 @@ def main():
             step_stride=max(int(args.step_stride), 1),
             block_stride=max(int(args.block_stride), 1),
             panel_size=float(args.panel_size),
+            attn_cmap=str(args.attn_cmap),
+            attn_gamma=float(args.attn_gamma),
+            high_attn_quantile=float(args.high_attn_quantile),
+            high_attn_contour_color=str(args.high_attn_contour_color),
+            high_attn_contour_width=float(args.high_attn_contour_width),
+            region_alpha=float(args.region_alpha),
+            boundary_linewidth=float(args.boundary_linewidth),
+            q_tokens_full=int(collector.meta.get(sorted(collector.meta.keys())[0], {}).get("q_tokens_full", 0)) if collector.meta else 0,
+            k_tokens_full=int(collector.meta.get(sorted(collector.meta.keys())[0], {}).get("k_tokens_full", 0)) if collector.meta else 0,
+            q_sample_indices=[int(x) for x in collector.meta.get(sorted(collector.meta.keys())[0], {}).get("q_sample_indices", [])] if collector.meta else [],
+            k_sample_indices=[int(x) for x in collector.meta.get(sorted(collector.meta.keys())[0], {}).get("k_sample_indices", [])] if collector.meta else [],
         )
+        if collector.meta:
+            sample_block = sorted(collector.meta.keys())[0]
+            token_summary = out_root / f"{key}_attn" / "token_layout_summary.txt"
+            save_token_layout_summary(
+                out_path=token_summary,
+                key=key,
+                prompt=prompt,
+                ref_labels=ref_labels,
+                collector=collector,
+                sample_block=sample_block,
+                step_block_maps=step_block_maps,
+                tokenizer=getattr(pipe, "tokenizer", None),
+            )
         done += 1
         print(f"[SUMMARY] key={key} generated_image={out_img}")
         print(f"[SUMMARY] key={key} fullmap={out_map}")
+        summary_path = out_root / f"{key}_attn" / "token_layout_summary.txt"
+        if summary_path.exists():
+            print(f"[SUMMARY] key={key} token_layout={summary_path}")
         print(f"[SELF-CHECK] key={key} {'PASS' if out_map.exists() else 'FAIL'}")
 
     print(f"[FINAL] done={done} skipped={skipped} total={len(keys)}")

@@ -15,6 +15,12 @@ python /data/benchmark_metrics/insight/qwen_2511_attention_fullmap.py \
   --step-stride 4 \
   --block-stride 4 \
   --panel-size 1.1 \
-  --image-dpi 120 \
+  --image-dpi 240 \
   --ref-labels cref,sref \
+  --attn-cmap turbo \
+  --attn-gamma 0.48 \
+  --high-attn-quantile 0.9 \
+  --high-attn-contour-color "#00e5ff" \
+  --high-attn-contour-width 1.0 \
+  --boundary-linewidth 1.6 \
   --save-format png

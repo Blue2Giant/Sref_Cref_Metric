@@ -20,23 +20,21 @@ ip18=10.201.16.5
 ip19=10.201.18.41
 ip20=10.201.18.28
 ip21=10.201.17.58
-ip22=10.201.19.49 
-ip23=10.201.16.19 #buffer
-ip24=10.201.16.50
-ip25=10.201.17.33
-ip26=10.201.16.49
-ip27=10.201.17.29
-ip28=10.201.18.8
-ip36=10.201.17.43
+ip22=10.201.16.19 #buffer
+ip23=10.201.16.50
+ip24=10.201.17.33
+ip25=10.201.16.49
+ip26=10.201.17.29
+ip27=10.201.17.43
 
 #tianshu
-ip29=100.107.142.131
-ip30=100.106.223.106
-ip31=100.106.114.48
-ip32=100.106.114.47
-ip33=100.106.194.78
-ip34=100.106.194.79
-ip35=100.107.142.131
+ip28=100.107.142.131
+ip29=100.106.223.106
+ip30=100.106.114.48
+ip31=100.106.114.47
+ip32=100.106.194.78
+ip33=100.106.194.79
+ip34=100.107.142.131
 
 output_meta_root=s3://lanjinghong-data/loras_eval_illustrious_one_img_magic
 lora_root=/mnt/jfs/all_loras/civitai/Illustrious/
@@ -56,7 +54,7 @@ while true; do
         --base-model Illustrious-XL-v1.0.safetensors \
         --workflow-json /data/benchmark_metrics/lora_pipeline/meta/workflows/sdxl_dual_lora_ljh.json \
         --prompt-txt "$triplet_prompt_txt" \
-        --comfy-host http://$ip1,http://$ip2,http://$ip3,http://$ip4,http://$ip5,http://$ip6,http://$ip7,http://$ip8,http://$ip9,http://$ip10,http://$ip11,http://$ip12,http://$ip13,http://$ip14,http://$ip15,http://$ip16,http://$ip17,http://$ip18,http://$ip19,http://$ip20,http://$ip21,http://$ip22,http://$ip23,http://$ip24,http://$ip25,http://$ip26,http://$ip27,http://$ip28,http://$ip29,http://$ip29,http://$ip30,http://$ip31,http://$ip32,http://$ip33,http://$ip34,http://$ip35,http://$ip36 \
+        --comfy-host http://$ip1,http://$ip2,http://$ip3,http://$ip4,http://$ip5,http://$ip6,http://$ip7,http://$ip8,http://$ip9,http://$ip10,http://$ip11,http://$ip12,http://$ip13,http://$ip14,http://$ip15,http://$ip16,http://$ip17,http://$ip18,http://$ip19,http://$ip20,http://$ip21,http://$ip22,http://$ip23,http://$ip24,http://$ip25,http://$ip26,http://$ip27,http://$ip28,http://$ip29,http://$ip29,http://$ip30,http://$ip31,http://$ip32,http://$ip33,http://$ip34 \
         --num-workers 8 \
         --download-retry-rounds 4 \
         --download-retry-wait 3 \

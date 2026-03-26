@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+key_txt=/data/benchmark_metrics/insight/key.txt
+
+python /data/benchmark_metrics/insight/qwen_style_lp_multiproc_launcher.py \
+  --python_bin python \
+  --run_py /data/benchmark_metrics/insight/qwen_2511_style_lp_guided_demo.py \
+  --prompts_json /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/prompts.json \
+  --cref_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/cref \
+  --sref_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/sref \
+  --out_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/qwen-edit-style-lp-lowmem-mp2-0.0-0.2-0.5 \
+  --model_name /mnt/jfs/model_zoo/qwen/Qwen-Image-Edit-2511/ \
+  --gpu_groups "0,1;2,3" \
+  --steps 28 \
+  --true_cfg_scale 4.0 \
+  --seed 42 \
+  --experiment lp_restore \
+  --lp_factor 4 \
+  --beta_schedule piecewise \
+  --early_ratio 0.35 \
+  --beta_early 0.0 \
+  --beta_mid 0.2 \
+  --beta_late 0.5 \
+  --max_sequence_length 256 \
+  --attention_slicing max \
+  --device_map balanced \
+  --max_memory_gpu 70GiB,70GiB \
+  --max_memory_cpu 800GiB \
+  --empty_cache_per_step 4
+python /data/benchmark_metrics/insight/qwen_style_lp_multiproc_launcher.py \
+  --python_bin python \
+  --run_py /data/benchmark_metrics/insight/qwen_2511_style_lp_guided_demo.py \
+  --prompts_json /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/prompts.json \
+  --cref_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/cref \
+  --sref_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/sref \
+  --out_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/qwen-edit-style-lp-lowmem-mp2—average \
+  --model_name /mnt/jfs/model_zoo/qwen/Qwen-Image-Edit-2511/ \
+  --gpu_groups "0,1;2,3" \
+  --steps 28 \
+  --true_cfg_scale 4.0 \
+  --seed 42 \
+  --experiment lp_restore \
+  --lp_factor 4 \
+  --beta_schedule piecewise \
+  --early_ratio 0.35 \
+  --beta_early 0.0 \
+  --beta_mid 0.5 \
+  --beta_late 0.1 \
+  --max_sequence_length 256 \
+  --attention_slicing max \
+  --device_map balanced \
+  --max_memory_gpu 70GiB,70GiB \
+  --max_memory_cpu 800GiB \
+  --empty_cache_per_step 4
+
+python /data/benchmark_metrics/insight/qwen_style_lp_multiproc_launcher.py \
+  --python_bin python \
+  --run_py /data/benchmark_metrics/insight/qwen_2511_style_lp_guided_demo.py \
+  --prompts_json /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/prompts.json \
+  --cref_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/cref \
+  --sref_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/sref \
+  --out_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/qwen-edit-style-lp-lowmem-mp2-0.3-0.5-0.8 \
+  --model_name /mnt/jfs/model_zoo/qwen/Qwen-Image-Edit-2511/ \
+  --gpu_groups "0,1;2,3" \
+  --steps 28 \
+  --true_cfg_scale 4.0 \
+  --seed 42 \
+  --experiment lp_restore \
+  --lp_factor 4 \
+  --beta_schedule piecewise \
+  --early_ratio 0.35 \
+  --beta_early 0.3 \
+  --beta_mid 0.5 \
+  --beta_late 0.8 \
+  --max_sequence_length 256 \
+  --attention_slicing max \
+  --device_map balanced \
+  --max_memory_gpu 70GiB,70GiB \
+  --max_memory_cpu 800GiB \
+  --empty_cache_per_step 4

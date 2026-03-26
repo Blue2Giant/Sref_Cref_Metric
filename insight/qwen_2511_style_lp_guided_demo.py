@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument("--out_dir", required=True, help="输出目录")
     parser.add_argument("--model_name", required=True)
     parser.add_argument("--gpus", default="0", help='如 "0" 或 "0,1,2"，本脚本仅使用第一个GPU')
-    parser.add_argument("--key_txt", required=True, help="txt文件，可包含多行key")
+    parser.add_argument("--key_txt", default="", help="可选，txt文件可包含多行key；为空时默认跑全部prompt")
     parser.add_argument("--negative-prompt", "--negative_prompt", dest="negative_prompt", default=" ")
     parser.add_argument("--steps", type=int, default=28)
     parser.add_argument("--true-cfg-scale", "--true_cfg_scale", dest="true_cfg_scale", type=float, default=4.0)
@@ -79,16 +79,19 @@ def load_prompts(path: str) -> Dict[str, str]:
 
 
 def read_keys(key_txt: str) -> List[str]:
+    if not str(key_txt).strip():
+        return []
+    p = Path(str(key_txt))
+    if not p.exists():
+        return []
     keys = []
     seen = set()
-    with open(key_txt, "r", encoding="utf-8") as f:
+    with open(str(p), "r", encoding="utf-8") as f:
         for line in f:
             s = (line or "").strip()
             if s and s not in seen:
                 keys.append(s)
                 seen.add(s)
-    if not keys:
-        raise RuntimeError(f"key_txt中没有可用key: {key_txt}")
     return keys
 
 
@@ -546,6 +549,9 @@ def main():
 
     prompts = load_prompts(args.prompts_json)
     keys = read_keys(args.key_txt)
+    if len(keys) == 0:
+        keys = sorted(str(k) for k in prompts.keys())
+        print(f"[INFO] key_txt为空或无有效key，已切换为全量prompts模式，总数={len(keys)}")
     done = 0
     skipped = 0
     for kidx, key in enumerate(keys):

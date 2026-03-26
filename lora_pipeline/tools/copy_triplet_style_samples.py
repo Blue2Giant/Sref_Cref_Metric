@@ -29,6 +29,15 @@ python /data/benchmark_metrics/lora_pipeline/tools/copy_triplet_style_samples.py
   --result-label 1 \
   --jpg-quality 78 \
   --overwrite
+
+python /data/benchmark_metrics/lora_pipeline/tools/copy_triplet_style_samples.py \
+  --binary-jsonl /data/benchmark_metrics/logs/triplet_content_firsthit_judge_0325_0.5_2/style_firsthit.jsonl \
+  --style-index-jsonl /data/benchmark_metrics/logs/selections_with_origin_content_flux.jsonl \
+  --output-root /mnt/jfs/lora_combine/triplet_content_firsthit_judge_0325_0.5_2 \
+  --sample-count 600 \
+  --result-label 1 \
+  --jpg-quality 78 \
+  --overwrite
 """
 import argparse
 import concurrent.futures

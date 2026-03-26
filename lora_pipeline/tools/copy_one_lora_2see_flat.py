@@ -34,7 +34,7 @@ python /data/benchmark_metrics/lora_pipeline/tools/copy_one_lora_2see_flat.py \
   --limit-one-per-model 4 \
   --convert-jpg \
   --jpg-quality 75 \
-  --limit-model-count 200
+  --limit-model-count 100
 
 python /data/benchmark_metrics/lora_pipeline/tools/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_flux_debug_1226 \

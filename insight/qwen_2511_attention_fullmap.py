@@ -4,6 +4,8 @@
 import argparse
 import json
 import math
+import multiprocessing as mp
+import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -22,13 +24,15 @@ def parse_args():
     parser.add_argument("--sref_dir", required=True, help="风格参考图目录，文件名应为 {id}.png")
     parser.add_argument("--out_dir", required=True, help="输出目录")
     parser.add_argument("--model_name", required=True)
-    parser.add_argument("--gpus", default="0", help='如 "0" 或 "0,1,2"，本脚本仅使用第一个GPU')
+    parser.add_argument("--gpus", default="0", help='如 "0" 或 "0,1,2"，会在这些GPU上并行推理')
     parser.add_argument("--key_txt", required=True, help="txt文件，可包含多行key")
     parser.add_argument("--negative-prompt", default=" ")
     parser.add_argument("--steps", type=int, default=28)
     parser.add_argument("--true-cfg-scale", type=float, default=4.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-tokens", type=int, default=128, help="attention矩阵q/k最大采样token数")
+    parser.add_argument("--max-q-tokens", type=int, default=0, help="query采样token上限，<=0时使用max-tokens")
+    parser.add_argument("--max-k-tokens", type=int, default=0, help="key采样token上限，<=0时使用max-tokens")
     parser.add_argument("--aggregate-head", choices=["mean", "max"], default="mean")
     parser.add_argument("--aggregate-block", choices=["mean", "max"], default="mean")
     parser.add_argument("--step-stride", type=int, default=4, help="每隔多少步采样一个step")
@@ -44,6 +48,7 @@ def parse_args():
     parser.add_argument("--high-attn-contour-width", type=float, default=0.8, help="高注意力区域轮廓线宽")
     parser.add_argument("--region-alpha", type=float, default=0.18, help="参考图分区底色透明度")
     parser.add_argument("--boundary-linewidth", type=float, default=2.0, help="参考图分界线宽度")
+    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
@@ -76,17 +81,86 @@ def read_keys(key_txt: str) -> List[str]:
     return keys
 
 
+def _dir_has_any_file(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    for _ in path.iterdir():
+        return True
+    return False
+
+
+def _is_valid_output_file(path: Path, save_format: str) -> bool:
+    if not path.exists() or (not path.is_file()):
+        return False
+    try:
+        size = int(path.stat().st_size)
+    except Exception:
+        return False
+    if size <= 65536:
+        return False
+    sf = str(save_format).lower().strip()
+    try:
+        with path.open("rb") as f:
+            head = f.read(16)
+        if sf == "png":
+            return head.startswith(b"\x89PNG\r\n\x1a\n")
+        if sf == "pdf":
+            return head.startswith(b"%PDF")
+    except Exception:
+        return False
+    return True
+
+
+def _has_complete_attention_outputs(key_attn_dir: Path, out_img: Path, save_format: str) -> bool:
+    out_map = key_attn_dir / f"attention_step_block_grid.{save_format}"
+    if not _is_valid_output_file(out_map, save_format):
+        return False
+    if not out_img.exists() or (not out_img.is_file()):
+        return False
+    try:
+        if int(out_img.stat().st_size) <= 0:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def parse_gpu_list(gpus_arg: str) -> List[int]:
+    raw = [x.strip() for x in str(gpus_arg).split(",") if x.strip()]
+    out: List[int] = []
+    seen = set()
+    for x in raw:
+        gpu = int(x)
+        if gpu < 0:
+            raise RuntimeError(f"GPU编号必须>=0，收到: {gpu}")
+        if gpu not in seen:
+            out.append(gpu)
+            seen.add(gpu)
+    if not out:
+        out = [0]
+    return out
+
+
+def split_keys_round_robin(keys: List[str], n_parts: int) -> List[List[str]]:
+    n = max(1, int(n_parts))
+    out: List[List[str]] = [[] for _ in range(n)]
+    for idx, key in enumerate(keys):
+        out[idx % n].append(key)
+    return out
+
+
 class AttentionCollector:
-    def __init__(self, max_tokens: int):
-        self.max_tokens = max(1, int(max_tokens))
+    def __init__(self, max_q_tokens: int, max_k_tokens: int):
+        self.max_q_tokens = max(1, int(max_q_tokens))
+        self.max_k_tokens = max(1, int(max_k_tokens))
         self.handles = []
         self.maps: Dict[int, torch.Tensor] = {}
         self.meta: Dict[int, Dict[str, object]] = {}
 
-    def _sample_tokens(self, n: int) -> torch.Tensor:
-        if n <= self.max_tokens:
+    def _sample_tokens(self, n: int, limit: int) -> torch.Tensor:
+        if n <= limit:
             return torch.arange(n, dtype=torch.long)
-        return torch.linspace(0, n - 1, steps=self.max_tokens).long()
+        return torch.linspace(0, n - 1, steps=limit).long()
 
     def _hook_fn(self, block_idx: int):
         def _fn(module, args, kwargs, output):
@@ -113,8 +187,8 @@ class AttentionCollector:
                 scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(float(hd))
                 attn = torch.softmax(scores, dim=-1)
                 attn = attn[0].detach().float().cpu()
-                q_idx = self._sample_tokens(attn.shape[1])
-                k_idx = self._sample_tokens(attn.shape[2])
+                q_idx = self._sample_tokens(attn.shape[1], self.max_q_tokens)
+                k_idx = self._sample_tokens(attn.shape[2], self.max_k_tokens)
                 attn = attn[:, q_idx][:, :, k_idx]
                 self.maps[block_idx] = attn
                 self.meta[block_idx] = {
@@ -208,6 +282,110 @@ def build_axis_layout(
         if i < len(sample_ranges) - 1:
             boundaries.append(se)
     return ticks, tick_labels, boundaries
+
+
+def build_k_semantic_ranges(k_full: int, has_encoder: bool, text_tokens_est: int, ref_labels: List[str]) -> List[Tuple[str, int, int]]:
+    k_full = max(0, int(k_full))
+    if k_full <= 0:
+        return []
+    if not has_encoder:
+        return [("noise", 0, k_full)]
+    text_len = min(max(int(text_tokens_est), 0), k_full)
+    ranges: List[Tuple[str, int, int]] = []
+    cursor = 0
+    if text_len > 0:
+        ranges.append(("text", 0, text_len))
+        cursor = text_len
+    remain = max(0, k_full - cursor)
+    if remain > 0 and len(ref_labels) > 0:
+        ref_ranges = build_ref_ranges(remain, len(ref_labels))
+        for ridx, rs, re in ref_ranges:
+            name = str(ref_labels[ridx]) if ridx < len(ref_labels) else f"ref{ridx}"
+            ranges.append((name, cursor + rs, cursor + re))
+        cursor = k_full
+    if cursor < k_full:
+        ranges.append(("noise", cursor, k_full))
+    return [(name, s, e) for name, s, e in ranges if e > s]
+
+
+def map_ranges_to_sample_ticks(
+    ranges: List[Tuple[str, int, int]],
+    sample_indices: List[int],
+    prefix: str,
+) -> Tuple[List[float], List[str], List[int]]:
+    if not ranges or not sample_indices:
+        return [], [], []
+    arr = np.asarray(sample_indices, dtype=np.int64)
+    ticks: List[float] = []
+    labels: List[str] = []
+    boundaries: List[int] = []
+    valid_count = 0
+    mapped: List[Tuple[str, int, int, int, int]] = []
+    for name, fs, fe in ranges:
+        loc = np.where((arr >= int(fs)) & (arr < int(fe)))[0]
+        if loc.size <= 0:
+            continue
+        ss = int(loc.min())
+        se = int(loc.max()) + 1
+        mapped.append((name, ss, se, int(fs), int(fe)))
+    for idx, (name, ss, se, fs, fe) in enumerate(mapped):
+        if se <= ss:
+            continue
+        valid_count += 1
+        ticks.append((ss + se - 1) * 0.5)
+        labels.append(f"{prefix}:{name} [{fs}-{fe - 1}]")
+        if idx < len(mapped) - 1:
+            boundaries.append(se)
+    if valid_count <= 0:
+        return [], [], []
+    return ticks, labels, boundaries
+
+
+def map_ranges_to_sample_spans(
+    ranges: List[Tuple[str, int, int]],
+    sample_indices: List[int],
+) -> List[Tuple[str, int, int]]:
+    if not ranges or not sample_indices:
+        return []
+    arr = np.asarray(sample_indices, dtype=np.int64)
+    mapped: List[Tuple[str, int, int]] = []
+    for name, fs, fe in ranges:
+        loc = np.where((arr >= int(fs)) & (arr < int(fe)))[0]
+        if loc.size <= 0:
+            continue
+        ss = int(loc.min())
+        se = int(loc.max()) + 1
+        if se > ss:
+            mapped.append((name, ss, se))
+    return mapped
+
+
+def _k_base_color(name: str) -> np.ndarray:
+    s = str(name or "").lower()
+    if "cref" in s:
+        return np.array([0.35, 0.05, 0.05], dtype=np.float32)
+    if "sref" in s:
+        return np.array([0.04, 0.10, 0.35], dtype=np.float32)
+    return np.array([0.05, 0.22, 0.10], dtype=np.float32)
+
+
+def render_segmented_attn_rgb(
+    mat_np: np.ndarray,
+    norm_obj,
+    k_spans: List[Tuple[str, int, int]],
+) -> np.ndarray:
+    h, w = mat_np.shape
+    base_cols = np.tile(np.array([0.05, 0.22, 0.10], dtype=np.float32), (w, 1))
+    for name, s, e in k_spans:
+        ss = max(0, int(s))
+        ee = min(w, int(e))
+        if ee > ss:
+            base_cols[ss:ee, :] = _k_base_color(name)
+    yellow = np.array([1.0, 1.0, 0.0], dtype=np.float32)
+    v = np.asarray(norm_obj(mat_np), dtype=np.float32)
+    v = np.clip(v, 0.0, 1.0)[..., None]
+    rgb = base_cols[None, :, :] * (1.0 - v) + yellow[None, None, :] * v
+    return np.clip(rgb, 0.0, 1.0)
 
 
 def aggregate_full_map(attn_maps: Dict[int, torch.Tensor], head_mode: str, block_mode: str) -> torch.Tensor:
@@ -337,6 +515,8 @@ def save_step_block_grid(
     k_tokens_full: int = 0,
     q_sample_indices: List[int] = None,
     k_sample_indices: List[int] = None,
+    has_encoder: bool = False,
+    text_tokens_est: int = 0,
 ):
     if len(step_block_maps) == 0:
         raise RuntimeError("没有可用的step-block attention")
@@ -350,8 +530,8 @@ def save_step_block_grid(
     k_indices = [int(x) for x in (k_sample_indices or list(range(int(sample.shape[1]))))]
     q_full = int(q_tokens_full) if int(q_tokens_full) > 0 else int(sample.shape[0])
     k_full = int(k_tokens_full) if int(k_tokens_full) > 0 else int(sample.shape[1])
-    y_ticks, y_labels, q_boundaries = build_axis_layout(q_full, q_indices, ref_labels, "Q")
-    x_ticks, x_labels, k_boundaries = build_axis_layout(k_full, k_indices, ref_labels, "K")
+    k_semantic_ranges = build_k_semantic_ranges(k_full, bool(has_encoder), int(text_tokens_est), ref_labels)
+    k_spans = map_ranges_to_sample_spans(k_semantic_ranges, k_indices)
 
     all_vals = []
     for s in steps:
@@ -380,25 +560,10 @@ def save_step_block_grid(
                 ax.axis("off")
                 continue
             mat_np = mat.numpy()
-            ax.imshow(mat_np, aspect="auto", cmap=attn_cmap, norm=norm)
-            q_thr = float(torch.quantile(mat.reshape(-1), min(max(float(high_attn_quantile), 0.5), 0.999)).item())
-            overlay_alpha = min(max(0.18 + 0.08 * float(high_attn_contour_width), 0.12), 0.55)
-            high_overlay = build_high_mask_overlay(mat_np, q_thr, high_attn_contour_color, overlay_alpha)
-            ax.imshow(high_overlay, aspect="auto", interpolation="nearest")
-            for y in q_boundaries:
-                ax.axhline(y - 0.5, color="#d8d8d8", linewidth=max(float(boundary_linewidth), 0.8) * 0.5, alpha=0.65)
-            for x in k_boundaries:
-                ax.axvline(x - 0.5, color="#d8d8d8", linewidth=max(float(boundary_linewidth), 0.8) * 0.5, alpha=0.65)
-            if ridx == len(steps) - 1 and x_ticks:
-                ax.set_xticks(x_ticks)
-                ax.set_xticklabels(x_labels, rotation=24, ha="right", fontsize=7)
-            else:
-                ax.set_xticks([])
-            if cidx == 0 and y_ticks:
-                ax.set_yticks(y_ticks)
-                ax.set_yticklabels(y_labels, fontsize=7)
-            else:
-                ax.set_yticks([])
+            rgb = render_segmented_attn_rgb(mat_np, norm, k_spans)
+            ax.imshow(rgb, aspect="auto")
+            ax.set_xticks([])
+            ax.set_yticks([])
             for sp in ax.spines.values():
                 sp.set_visible(True)
                 sp.set_color("black")
@@ -428,14 +593,14 @@ def save_full_map(
     high_attn_contour_width: float,
     region_alpha: float,
     boundary_linewidth: float,
+    has_encoder: bool = False,
+    text_tokens_est: int = 0,
 ):
     q_len = int(full_map.shape[0])
     k_len = int(full_map.shape[1])
-    num_refs = len(ref_labels)
-    q_ranges = build_ref_ranges(q_len, num_refs)
-    k_ranges = build_ref_ranges(k_len, num_refs)
-    x_ticks, x_labels = build_ref_ticks(k_ranges, ref_labels, "K")
-    y_ticks, y_labels = build_ref_ticks(q_ranges, ref_labels, "Q")
+    k_indices = list(range(k_len))
+    k_semantic_ranges = build_k_semantic_ranges(k_len, bool(has_encoder), int(text_tokens_est), ref_labels)
+    k_spans = map_ranges_to_sample_spans(k_semantic_ranges, k_indices)
     flat = full_map.reshape(-1)
     vmin = float(torch.quantile(flat, 0.02).item())
     vmax = float(torch.quantile(flat, 0.995).item())
@@ -448,21 +613,10 @@ def save_full_map(
 
     fig, ax = plt.subplots(figsize=(8, 6))
     full_np = full_map.numpy()
-    ax.imshow(full_np, aspect="auto", cmap=attn_cmap, norm=norm)
-    q_thr = float(torch.quantile(flat, min(max(float(high_attn_quantile), 0.5), 0.999)).item())
-    overlay_alpha = min(max(0.18 + 0.08 * float(high_attn_contour_width), 0.12), 0.55)
-    high_overlay = build_high_mask_overlay(full_np, q_thr, high_attn_contour_color, overlay_alpha)
-    ax.imshow(high_overlay, aspect="auto", interpolation="nearest")
-    for _, qs, _ in q_ranges[1:]:
-        ax.axhline(qs - 0.5, color="#d8d8d8", linewidth=max(float(boundary_linewidth), 0.8) * 0.55, alpha=0.65)
-    for _, ks, _ in k_ranges[1:]:
-        ax.axvline(ks - 0.5, color="#d8d8d8", linewidth=max(float(boundary_linewidth), 0.8) * 0.55, alpha=0.65)
-    if x_ticks:
-        ax.set_xticks(x_ticks)
-        ax.set_xticklabels(x_labels, rotation=20, ha="right", fontsize=8)
-    if y_ticks:
-        ax.set_yticks(y_ticks)
-        ax.set_yticklabels(y_labels, fontsize=8)
+    rgb = render_segmented_attn_rgb(full_np, norm, k_spans)
+    ax.imshow(rgb, aspect="auto")
+    ax.set_xticks([])
+    ax.set_yticks([])
     ax.set_title(f"Full Attention Map (head={head_mode}, block={block_mode})")
     ax.set_xlabel("key tokens")
     ax.set_ylabel("query tokens")
@@ -471,39 +625,51 @@ def save_full_map(
     plt.close(fig)
 
 
-def main():
-    args = parse_args()
-    gpu_list = [int(x.strip()) for x in str(args.gpus).split(",") if x.strip()]
-    gpu = gpu_list[0] if gpu_list else 0
-    if torch.cuda.is_available():
+def run_inference_worker(
+    worker_idx: int,
+    gpu: int,
+    args,
+    prompts: Dict[str, str],
+    keys: List[str],
+    key_to_index: Dict[str, int],
+) -> Tuple[int, int]:
+    use_cuda = torch.cuda.is_available() and gpu >= 0
+    if use_cuda:
         torch.cuda.set_device(gpu)
         device = torch.device(f"cuda:{gpu}")
         dtype = torch.bfloat16
     else:
         device = torch.device("cpu")
         dtype = torch.float32
-
     from diffusers import QwenImageEditPlusPipeline
 
     pipe = QwenImageEditPlusPipeline.from_pretrained(args.model_name, torch_dtype=dtype).to(device)
     pipe.set_progress_bar_config(disable=False)
-
-    prompts = load_prompts(args.prompts_json)
-    keys = read_keys(args.key_txt)
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
     done = 0
     skipped = 0
-    for idx, key in enumerate(keys):
+    for key in keys:
         if key not in prompts:
-            print(f"[SKIP] key不在prompts_json中，已跳过: {key}")
+            print(f"[SKIP][worker={worker_idx}][gpu={gpu}] key不在prompts_json中，已跳过: {key}")
             skipped += 1
             continue
+        key_attn_dir = out_root / f"{key}_attn"
+        out_img = out_root / f"{key}.png"
+        if (not args.overwrite) and _has_complete_attention_outputs(key_attn_dir, out_img, args.save_format):
+            print(f"[SKIP][worker={worker_idx}][gpu={gpu}] 已存在完整输出: {key_attn_dir}")
+            skipped += 1
+            continue
+        if args.overwrite:
+            if key_attn_dir.exists():
+                shutil.rmtree(key_attn_dir, ignore_errors=True)
+            if out_img.exists():
+                out_img.unlink()
         cref_path = Path(args.cref_dir) / f"{key}.png"
         sref_path = Path(args.sref_dir) / f"{key}.png"
         if not cref_path.exists() or not sref_path.exists():
-            print(f"[SKIP] 图片缺失: key={key} cref={cref_path.exists()} sref={sref_path.exists()}")
+            print(f"[SKIP][worker={worker_idx}][gpu={gpu}] 图片缺失: key={key} cref={cref_path.exists()} sref={sref_path.exists()}")
             skipped += 1
             continue
 
@@ -516,13 +682,22 @@ def main():
             ref_labels += [f"ref{i}" for i in range(len(ref_labels), len(images))]
         ref_labels = ref_labels[: len(images)]
 
-        collector = AttentionCollector(max_tokens=args.max_tokens)
+        max_q_tokens = int(args.max_q_tokens) if int(args.max_q_tokens) > 0 else int(args.max_tokens)
+        max_k_tokens = int(args.max_k_tokens) if int(args.max_k_tokens) > 0 else int(args.max_tokens)
+        collector = AttentionCollector(max_q_tokens=max_q_tokens, max_k_tokens=max_k_tokens)
+        text_tokens_est = 0
+        if hasattr(pipe, "tokenizer") and pipe.tokenizer is not None:
+            try:
+                text_tokens_est = int(pipe.tokenizer(prompt, return_tensors="pt").input_ids.shape[1])
+            except Exception:
+                text_tokens_est = 0
         if hasattr(pipe, "transformer") and pipe.transformer is not None:
             collector.register(pipe.transformer)
         else:
             collector.register(pipe.unet if hasattr(pipe, "unet") else pipe)
 
-        generator = torch.Generator(device=device).manual_seed(int(args.seed) + idx)
+        seed_offset = int(key_to_index.get(key, 0))
+        generator = torch.Generator(device=device).manual_seed(int(args.seed) + seed_offset)
         step_block_maps: Dict[int, Dict[int, torch.Tensor]] = {}
 
         def on_step_end(_pipe, step, timestep, callback_kwargs):
@@ -552,7 +727,6 @@ def main():
             ).images[0]
         collector.remove()
 
-        out_img = out_root / f"{key}.png"
         out.save(out_img)
         if len(step_block_maps) == 0:
             cur = {}
@@ -584,6 +758,8 @@ def main():
             k_tokens_full=int(collector.meta.get(sorted(collector.meta.keys())[0], {}).get("k_tokens_full", 0)) if collector.meta else 0,
             q_sample_indices=[int(x) for x in collector.meta.get(sorted(collector.meta.keys())[0], {}).get("q_sample_indices", [])] if collector.meta else [],
             k_sample_indices=[int(x) for x in collector.meta.get(sorted(collector.meta.keys())[0], {}).get("k_sample_indices", [])] if collector.meta else [],
+            has_encoder=bool(collector.meta.get(sorted(collector.meta.keys())[0], {}).get("has_encoder", False)) if collector.meta else False,
+            text_tokens_est=int(text_tokens_est),
         )
         if collector.meta:
             sample_block = sorted(collector.meta.keys())[0]
@@ -599,12 +775,51 @@ def main():
                 tokenizer=getattr(pipe, "tokenizer", None),
             )
         done += 1
-        print(f"[SUMMARY] key={key} generated_image={out_img}")
-        print(f"[SUMMARY] key={key} fullmap={out_map}")
+        print(f"[SUMMARY][worker={worker_idx}][gpu={gpu}] key={key} generated_image={out_img}")
+        print(f"[SUMMARY][worker={worker_idx}][gpu={gpu}] key={key} fullmap={out_map}")
         summary_path = out_root / f"{key}_attn" / "token_layout_summary.txt"
         if summary_path.exists():
-            print(f"[SUMMARY] key={key} token_layout={summary_path}")
-        print(f"[SELF-CHECK] key={key} {'PASS' if out_map.exists() else 'FAIL'}")
+            print(f"[SUMMARY][worker={worker_idx}][gpu={gpu}] key={key} token_layout={summary_path}")
+        print(f"[SELF-CHECK][worker={worker_idx}][gpu={gpu}] key={key} {'PASS' if out_map.exists() else 'FAIL'}")
+
+    return done, skipped
+
+
+def main():
+    args = parse_args()
+    prompts = load_prompts(args.prompts_json)
+    keys = read_keys(args.key_txt)
+    key_to_index = {k: i for i, k in enumerate(keys)}
+    gpu_list = parse_gpu_list(args.gpus)
+    if torch.cuda.is_available():
+        gpu_count = int(torch.cuda.device_count())
+        invalid = [g for g in gpu_list if g >= gpu_count]
+        if invalid:
+            raise RuntimeError(f"GPU编号越界: {invalid}，当前可见GPU数量={gpu_count}")
+    else:
+        gpu_list = [0]
+
+    if len(gpu_list) <= 1 or not torch.cuda.is_available():
+        done, skipped = run_inference_worker(
+            worker_idx=0,
+            gpu=int(gpu_list[0]),
+            args=args,
+            prompts=prompts,
+            keys=keys,
+            key_to_index=key_to_index,
+        )
+    else:
+        chunks = split_keys_round_robin(keys, len(gpu_list))
+        tasks = []
+        for worker_idx, (gpu, sub_keys) in enumerate(zip(gpu_list, chunks)):
+            if not sub_keys:
+                continue
+            tasks.append((worker_idx, int(gpu), args, prompts, sub_keys, key_to_index))
+        mp_ctx = mp.get_context("spawn")
+        with mp_ctx.Pool(processes=len(tasks)) as pool:
+            results = pool.starmap(run_inference_worker, tasks)
+        done = int(sum(x[0] for x in results))
+        skipped = int(sum(x[1] for x in results))
 
     print(f"[FINAL] done={done} skipped={skipped} total={len(keys)}")
 

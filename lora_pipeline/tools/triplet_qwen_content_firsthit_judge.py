@@ -270,13 +270,16 @@ def _judge_one(task: Dict[str, Any]) -> Dict[str, Any]:
     return {"pair_key": pair_key, "value": out_value, "error": ""}
 
 
-def _worker(model: str, base_url: str, tasks: List[Dict[str, Any]], result_queue: mp.Queue, args_obj: Any):
+def _worker_queue(model: str, base_url: str, task_queue: mp.Queue, result_queue: mp.Queue, args_obj: Any):
     base.MODEL = model
     base.BASE_URL = base_url
     base.G_ARGS = args_obj
     global G_ARGS
     G_ARGS = args_obj
-    for task in tasks:
+    while True:
+        task = task_queue.get()
+        if task is None:
+            break
         try:
             result_queue.put(_judge_one(task))
         except Exception as e:
@@ -371,9 +374,6 @@ def main():
     for _ in range(pp):
         for ep in endpoints:
             worker_specs.append(ep)
-    chunks: List[List[Dict[str, Any]]] = [[] for _ in range(len(worker_specs))]
-    for idx, t in enumerate(tasks):
-        chunks[idx % len(worker_specs)].append(t)
 
     out_path = args.out_jsonl
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -381,13 +381,15 @@ def main():
     if err_path:
         os.makedirs(os.path.dirname(err_path) or ".", exist_ok=True)
 
+    task_queue: mp.Queue = mp.Queue()
+    for t in tasks:
+        task_queue.put(t)
+    for _ in range(len(worker_specs)):
+        task_queue.put(None)
     result_queue: mp.Queue = mp.Queue()
     workers: List[mp.Process] = []
-    for i, (m, u) in enumerate(worker_specs):
-        sub = chunks[i]
-        if not sub:
-            continue
-        p = mp.Process(target=_worker, args=(m, u, sub, result_queue, args))
+    for m, u in worker_specs:
+        p = mp.Process(target=_worker_queue, args=(m, u, task_queue, result_queue, args))
         p.daemon = False
         p.start()
         workers.append(p)

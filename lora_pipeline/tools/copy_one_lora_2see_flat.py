@@ -25,8 +25,8 @@ python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
 
 python /data/benchmark_metrics/lora_pipeline/tools/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_flux_debug_1226 \
-  --one-lora-root /mnt/jfs/loras_combine/flux_0321_one_lora \
-  --out-root /mnt/jfs/loras_combine/flux_merged_eval_compare_flat_content_0321 \
+  --one-lora-root /mnt/jfs/loras_combine/flux_0326_one_lora \
+  --out-root /mnt/jfs/loras_combine/flux_merged_eval_compare_flat_content_0326 \
   --eval-subfolder eval_images_with_negative/ \
   --one-subfolder eval_images_with_negative_new \
   --only-model-ids /data/LoraPipeline/assets/flux_content_sample.txt \

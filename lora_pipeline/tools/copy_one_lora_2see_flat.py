@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
+python /data/benchmark_metrics/lora_pipeline/tools/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_illustrious_one_img_magic \
-  --one-lora-root output_root=/mnt/jfs/loras_combine/illustrious_0321_two_lora  \
-  --out-root /mnt/jfs/loras_combine/illustrious_0321_two_lora_600 \
+  --one-lora-root /mnt/jfs/loras_combine/illustrious_0321_two_lora  \
+  --out-root /mnt/jfs/loras_combine/illustrious_0321_two_lora_2see \
   --eval-subfolder eval_images_with_negative_new \
   --one-subfolder eval_images_with_negative_new \
   --only-model-ids /data/LoraPipeline/assets/illustrious_content_sample_final.txt \
   --limit-eval-per-model 10 \
-  --limit-one-per-model 10
-
+  --limit-one-per-model 10 \
+  --convert-jpg \
+  --jpg-quality 75
 
 python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_qwen \
@@ -64,7 +65,7 @@ python /data/benchmark_metrics/lora_pipeline/tools/copy_one_lora_2see_flat.py \
   --limit-model-count 400 \
   --workers 128
 
-python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
+python /data/benchmark_metrics/lora_pipeline/tools/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_illustrious_one_img_magic \
   --one-lora-root /mnt/jfs/loras_combine/illustrious_0321_dual_lora \
   --out-root /mnt/jfs/loras_combine/illustrious_merged_eval_compare_illustrious_flat_v4b_new \
@@ -74,7 +75,7 @@ python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
   --limit-eval-per-model 4 \
   --limit-one-per-model 4 \
   --convert-jpg \
-  --jpg-quality 82
+  --jpg-quality 73
 
 python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_qwen \
@@ -86,15 +87,17 @@ python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
   --limit-eval-per-model 4 \
   --limit-one-per-model 4
 
-python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
+python /data/benchmark_metrics/lora_pipeline/tools/copy_one_lora_2see_flat.py\
   --eval-root /mnt/jfs/loras_combine/qwen_0323_one_lora \
   --one-lora-root /mnt/jfs/loras_combine/qwen_0316_one_lora \
-  --out-root /mnt/jfs/loras_combine/qwen_0323_one_lora_2see \
+  --out-root /mnt/jfs/loras_combine/qwen_0323_one_lora_2see_new \
   --eval-subfolder eval_images_with_negative_new/ \
   --one-subfolder eval_images_with_negative_new \
   --only-model-ids /data/LoraPipeline/similarity_stats/qwen_ids.txt \
   --limit-eval-per-model 10 \
-  --limit-one-per-model 10
+  --limit-one-per-model 10 \
+  --convert-jpg \
+  --jpg-quality 73
 
 python /data/LoraPipeline/utils/copy_one_lora_2see_flat.py \
   --eval-root s3://lanjinghong-data/loras_eval_flux_debug_1226 \

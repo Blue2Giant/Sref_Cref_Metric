@@ -31,6 +31,30 @@ python /data/benchmark_metrics/lora_pipeline/tools/copy_triplet_style_samples.py
   --overwrite
 
 python /data/benchmark_metrics/lora_pipeline/tools/copy_triplet_style_samples.py \
+  --binary-jsonl /data/benchmark_metrics/logs/triplet_style_firsthit_judge_0325_0.5_2_2match/style_firsthit.jsonl \
+  --output-root /mnt/jfs/lora_combine/triplet_style_copy_debug_firsthit_0325_0.5_2_2match \
+  --sample-count 600 \
+  --result-label 1 \
+  --jpg-quality 78 \
+  --overwrite
+
+python /data/benchmark_metrics/lora_pipeline/tools/copy_triplet_style_samples.py \
+  --binary-jsonl /data/benchmark_metrics/logs/triplet_style_firsthit_judge_0325_0.5_2_2match_global_judge/style_firsthit.jsonl \
+  --output-root /mnt/jfs/lora_combine/triplet_style_firsthit_judge_0325_0.5_2_st5_2_2match_global_judge_2see \
+  --sample-count 600 \
+  --result-label 1 \
+  --jpg-quality 78 \
+  --overwrite
+
+python /data/benchmark_metrics/lora_pipeline/tools/copy_triplet_style_samples.py \
+  --binary-jsonl /data/benchmark_metrics/logs/triplet_style_firsthit_judge_0325_0.55_2_2match_global_judge/style_firsthit.jsonl \
+  --output-root /mnt/jfs/lora_combine/triplet_style_firsthit_judge_0325_0.55_2_2match_global_judge2see \
+  --sample-count 600 \
+  --result-label 1 \
+  --jpg-quality 78 \
+  --overwrite
+
+python /data/benchmark_metrics/lora_pipeline/tools/copy_triplet_style_samples.py \
   --binary-jsonl /data/benchmark_metrics/logs/triplet_content_firsthit_judge_0325_0.5_2/style_firsthit.jsonl \
   --style-index-jsonl /data/benchmark_metrics/logs/selections_with_origin_content_flux.jsonl \
   --output-root /mnt/jfs/lora_combine/triplet_content_firsthit_judge_0325_0.5_2 \
@@ -46,7 +70,7 @@ import json
 import os
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image
 from megfile import smart_exists, smart_open
@@ -64,8 +88,8 @@ def log(msg: str):
     print(msg, flush=True)
 
 
-def read_binary_labels(path: str) -> Dict[str, Dict[str, Optional[str]]]:
-    out: Dict[str, Dict[str, Optional[str]]] = {}
+def read_binary_labels(path: str) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
     if not os.path.isfile(path):
         raise RuntimeError(f"判别结果文件不存在: {path}")
     with open(path, "r", encoding="utf-8") as f:
@@ -83,10 +107,21 @@ def read_binary_labels(path: str) -> Dict[str, Dict[str, Optional[str]]]:
                 if not isinstance(k, str):
                     continue
                 if v in (0, 1):
-                    out[k] = {"label": int(v), "firsthit_path": None}
+                    out[k] = {"label": int(v), "firsthit_path": None, "firsthit_paths": []}
                 elif isinstance(v, str):
                     vv = v.strip()
-                    out[k] = {"label": 1 if vv else 0, "firsthit_path": vv or None}
+                    out[k] = {
+                        "label": 1 if vv else 0,
+                        "firsthit_path": vv or None,
+                        "firsthit_paths": [vv] if vv else [],
+                    }
+                elif isinstance(v, list):
+                    paths = [str(x).strip() for x in v if isinstance(x, str) and str(x).strip()]
+                    out[k] = {
+                        "label": 1 if paths else 0,
+                        "firsthit_path": paths[0] if paths else None,
+                        "firsthit_paths": paths,
+                    }
     return out
 
 
@@ -162,7 +197,7 @@ def _copy_task(src: str, dst: str, jpg_quality: int, pair_key: str) -> Tuple[boo
 
 
 def build_samples(
-    labels: Dict[str, Dict[str, Optional[str]]],
+    labels: Dict[str, Dict[str, Any]],
     triplets: Dict[str, List[str]],
     styles: Dict[str, List[str]],
     target_label: int,
@@ -183,7 +218,20 @@ def build_samples(
         if not triplet_paths:
             stats["skip_no_triplet"] += 1
             continue
+        firsthit_paths = [str(x).strip() for x in (payload.get("firsthit_paths") or []) if str(x).strip()]
         firsthit_path = (payload.get("firsthit_path") or "").strip()
+        if firsthit_paths:
+            style_paths = firsthit_paths
+            records.append(
+                SampleRecord(
+                    pair_key=pair_key,
+                    label=label,
+                    triplet_paths=triplet_paths,
+                    style_paths=style_paths,
+                )
+            )
+            stats["matched"] += 1
+            continue
         if firsthit_path:
             style_paths = [firsthit_path]
             records.append(

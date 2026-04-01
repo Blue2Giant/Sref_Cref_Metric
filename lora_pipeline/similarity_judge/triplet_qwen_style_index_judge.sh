@@ -7,7 +7,7 @@ if [ "$overwrite" = "1" ]; then
     extra_args="--overwrite"
 fi
 
-python3 /data/benchmark_metrics/lora_pipeline/tools/triplet_qwen_style_index_judge.py \
+python3 /data/benchmark_metrics/lora_pipeline/similarity_judge/triplet_qwen_style_index_judge.py \
     --triplet-jsonl "$triplet_jsonl" \
     --style-index-jsonl "$style_index_jsonl" \
     --out-jsonl "${OUT_DIR}/style_binary.jsonl" \

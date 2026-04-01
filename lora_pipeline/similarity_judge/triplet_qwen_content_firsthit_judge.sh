@@ -34,7 +34,7 @@ OUT_DIR=/data/benchmark_metrics/logs/triplet_content_firsthit_judge_0325_0.5_2
 
 #triplet update 0327
 OUT_DIR=/data/benchmark_metrics/logs/triplet_content_firsthit_judge_0325_0.5_2
-python3 /data/benchmark_metrics/lora_pipeline/tools/triplet_qwen_content_firsthit_judge.py \
+python3 /data/benchmark_metrics/lora_pipeline/similarity_judge/triplet_qwen_content_firsthit_judge.py \
     --triplet-jsonl $triplet_jsonl \
     --content-index-jsonl $content_jsonl \
     --out-jsonl "${OUT_DIR}/style_firsthit.jsonl" \

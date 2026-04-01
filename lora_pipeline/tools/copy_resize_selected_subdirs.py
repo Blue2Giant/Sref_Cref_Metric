@@ -9,6 +9,26 @@ python3 /data/benchmark_metrics/utils/copy_resize_selected_subdirs.py \
   --long-edge 1024 \
   --quality 75 \
   --workers 64
+
+python3 /data/benchmark_metrics/utils/copy_resize_selected_subdirs.py \
+  --src-root /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content \
+  --dst-root /mnt/jfs/lora_combine/logs/sample_800_sref_200_content_jpg1024_flux2 \
+  --subdir cref \
+  --subdir sref \
+  --subdir newnew800_flux_9b \
+  --long-edge 1024 \
+  --quality 75 \
+  --workers 64
+
+python3 /data/benchmark_metrics/utils/copy_resize_selected_subdirs.py \
+  --src-root /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content \
+  --dst-root /mnt/jfs/lora_combine/logs/sample_800_sref_200_content_jpg1024_ours \
+  --subdir cref \
+  --subdir sref \
+  --subdir ours \
+  --long-edge 1024 \
+  --quality 75 \
+  --workers 64
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed

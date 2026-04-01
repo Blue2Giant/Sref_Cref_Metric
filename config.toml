@@ -1,0 +1,56 @@
+model = "gpt-5.4"
+model_provider = "neo"
+preferred_auth_method = "apikey"
+  
+model_reasoning_summary_format = "experimental"  
+model_reasoning_summary = "detailed"  
+model_reasoning_effort = "xhigh"
+model_verbosity = "medium" 
+
+approval_policy = "never"  
+sandbox_mode = "danger-full-access"  
+
+model_auto_compact_token_limit = 244800  
+model_context_window = 272000
+model_max_output_tokens = 128000
+
+
+include_plan_tool = true  
+include_apply_patch_tool = true  
+tools_web_search = true  
+
+project_doc_max_bytes = 65536  
+personality = "pragmatic"
+
+suppress_unstable_features_warning = true
+
+
+
+[agents]
+max_threads=10
+
+
+[features]
+multi_agent = true
+plan_tool = true
+apply_patch_freeform = true
+view_image_tool = true
+unified_exec = true
+shell_snapshot = true
+steer = true
+
+
+[model_providers.neo]
+name = "NEO"
+base_url = "https://crs.us.bestony.com/openai"
+env_key = "NEO_KEY"
+wire_api = "responses"
+
+
+[notice]
+"hide_gpt-5.1-codex-max_migration_prompt" = true
+
+[notice.model_migrations]
+"gpt-5.2" = "gpt-5.2-codex"
+[tui]
+status_line = ["model-name", "model-with-reasoning", "current-dir", "git-branch", "context-remaining", "five-hour-limit"]

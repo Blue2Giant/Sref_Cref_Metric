@@ -5,9 +5,10 @@ import argparse
 import json
 import math
 import multiprocessing as mp
+from queue import Empty
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
@@ -15,15 +16,21 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from tqdm.auto import tqdm
 
 
 def parse_args():
-    parser = argparse.ArgumentParser("Qwen-Image-Edit-2511 Attention FullMap 可视化")
+    parser = argparse.ArgumentParser("Qwen-Image-Edit-2511 Attention FullMap 可视化（K全量，Q采样）")
     parser.add_argument("--prompts_json", required=True, help="id->prompt 的json文件")
     parser.add_argument("--cref_dir", required=True, help="内容参考图目录，文件名应为 {id}.png")
     parser.add_argument("--sref_dir", required=True, help="风格参考图目录，文件名应为 {id}.png")
     parser.add_argument("--out_dir", required=True, help="输出目录")
     parser.add_argument("--model_name", required=True)
+    parser.add_argument(
+        "--transformer_ckpt",
+        default="",
+        help="可选，自定义 transformer 权重。支持 safetensors/pt 文件，或训练态 DCP checkpoint 目录。",
+    )
     parser.add_argument("--gpus", default="0", help='如 "0" 或 "0,1,2"，会在这些GPU上并行推理')
     parser.add_argument("--key_txt", required=True, help="txt文件，可包含多行key")
     parser.add_argument("--negative-prompt", default=" ")
@@ -32,7 +39,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-tokens", type=int, default=128, help="attention矩阵q/k最大采样token数")
     parser.add_argument("--max-q-tokens", type=int, default=0, help="query采样token上限，<=0时使用max-tokens")
-    parser.add_argument("--max-k-tokens", type=int, default=0, help="key采样token上限，<=0时使用max-tokens")
+    parser.add_argument("--max-k-tokens", type=int, default=0, help="兼容保留参数；本脚本在K维不采样，会保留全部key token")
     parser.add_argument("--aggregate-head", choices=["mean", "max"], default="mean")
     parser.add_argument("--aggregate-block", choices=["mean", "max"], default="mean")
     parser.add_argument("--step-stride", type=int, default=4, help="每隔多少步采样一个step")
@@ -49,6 +56,7 @@ def parse_args():
     parser.add_argument("--region-alpha", type=float, default=0.18, help="参考图分区底色透明度")
     parser.add_argument("--boundary-linewidth", type=float, default=2.0, help="参考图分界线宽度")
     parser.add_argument("--save-attn-tensor", action="store_true", help="额外保存用于绘图的attention张量为pt文件")
+    parser.add_argument("--show-inner-progress", action="store_true", help="显示diffusers内部step进度条；默认关闭，仅显示总进度")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -66,6 +74,197 @@ def load_prompts(path: str) -> Dict[str, str]:
     if not isinstance(data, dict):
         raise RuntimeError(f"prompts_json 结构错误: {path}")
     return {str(k): str(v) for k, v in data.items()}
+
+
+def _normalize_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    normalized: Dict[str, torch.Tensor] = {}
+    prefixes = (
+        "model.diffusion_model.",
+        "model.",
+        "base_model.model.",
+    )
+    for key, value in state_dict.items():
+        new_key = str(key)
+        for prefix in prefixes:
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix) :]
+        normalized[new_key] = value
+    return normalized
+
+
+def _load_raw_transformer_checkpoint(path: str) -> Dict[str, torch.Tensor]:
+    ckpt_path = Path(path).expanduser()
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"transformer_ckpt 不存在: {ckpt_path}")
+
+    if ckpt_path.is_dir():
+        from torch.distributed.checkpoint.format_utils import FileSystemReader, _EmptyStateDictLoadPlanner
+        from torch.distributed.checkpoint.state_dict_loader import _load_state_dict
+
+        from vgo.utils.convert_weights import rearrange_weights
+
+        state = {}
+        _load_state_dict(
+            state,
+            storage_reader=FileSystemReader(str(ckpt_path)),
+            planner=_EmptyStateDictLoadPlanner(),
+            no_dist=True,
+        )
+        if "model" not in state or not isinstance(state["model"], dict):
+            raise RuntimeError(f"DCP checkpoint 中未找到 model state_dict: {ckpt_path}")
+        checkpoint = state["model"]
+        checkpoint = rearrange_weights(checkpoint)
+        return _normalize_state_dict_keys(checkpoint)
+
+    if ckpt_path.suffix == ".safetensors":
+        from safetensors.torch import load_file
+
+        checkpoint = load_file(str(ckpt_path), device="cpu")
+    else:
+        checkpoint = torch.load(str(ckpt_path), map_location="cpu")
+
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+        checkpoint = checkpoint["state_dict"]
+    elif isinstance(checkpoint, dict) and "model" in checkpoint and isinstance(checkpoint["model"], dict):
+        checkpoint = checkpoint["model"]
+
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(f"无法解析 transformer checkpoint: {ckpt_path}")
+
+    tensor_state_dict = {str(k): v for k, v in checkpoint.items() if torch.is_tensor(v)}
+    return _normalize_state_dict_keys(tensor_state_dict)
+
+
+def _swap_shift_scale(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.shape[0] % 2 != 0:
+        raise RuntimeError(f"无法执行 shift/scale 交换，第一维不是偶数: shape={tuple(tensor.shape)}")
+    shift, scale = tensor.chunk(2, dim=0)
+    return torch.cat([scale, shift], dim=0)
+
+
+def _pop_tensor(checkpoint: Dict[str, torch.Tensor], key: str) -> torch.Tensor:
+    if key not in checkpoint:
+        raise KeyError(f"checkpoint 缺少必要权重: {key}")
+    return checkpoint.pop(key)
+
+
+def convert_vgo_transformer_to_diffusers(checkpoint: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    checkpoint = dict(checkpoint)
+    converted: Dict[str, torch.Tensor] = {}
+
+    if any(key.startswith("guidance_in.") for key in checkpoint):
+        raise RuntimeError("当前脚本不支持带 guidance_in 的自定义 transformer 权重")
+    if any(key.startswith("vector_in.") for key in checkpoint):
+        raise RuntimeError("当前脚本不支持带 vector_in 的自定义 transformer 权重")
+    if any(key.startswith("single_blocks.") for key in checkpoint):
+        raise RuntimeError("当前脚本不支持带 single_blocks 的自定义 transformer 权重")
+
+    layer_ids = sorted({int(key.split(".")[1]) for key in checkpoint if key.startswith("double_blocks.")})
+    if not layer_ids:
+        raise RuntimeError("checkpoint 中未找到 double_blocks.*，不像是当前仓库导出的 transformer 权重")
+
+    converted["img_in.weight"] = _pop_tensor(checkpoint, "img_in.weight")
+    converted["img_in.bias"] = _pop_tensor(checkpoint, "img_in.bias")
+
+    if "txt_norm.scale" in checkpoint:
+        converted["txt_norm.weight"] = checkpoint.pop("txt_norm.scale")
+    elif "txt_norm.weight" in checkpoint:
+        converted["txt_norm.weight"] = checkpoint.pop("txt_norm.weight")
+
+    converted["txt_in.weight"] = _pop_tensor(checkpoint, "txt_in.weight")
+    converted["txt_in.bias"] = _pop_tensor(checkpoint, "txt_in.bias")
+
+    converted["time_text_embed.timestep_embedder.linear_1.weight"] = _pop_tensor(checkpoint, "time_in.in_layer.weight")
+    converted["time_text_embed.timestep_embedder.linear_1.bias"] = _pop_tensor(checkpoint, "time_in.in_layer.bias")
+    converted["time_text_embed.timestep_embedder.linear_2.weight"] = _pop_tensor(
+        checkpoint, "time_in.out_layer.weight"
+    )
+    converted["time_text_embed.timestep_embedder.linear_2.bias"] = _pop_tensor(checkpoint, "time_in.out_layer.bias")
+
+    for layer_id in layer_ids:
+        src = f"double_blocks.{layer_id}"
+        dst = f"transformer_blocks.{layer_id}"
+
+        img_q, img_k, img_v = torch.chunk(_pop_tensor(checkpoint, f"{src}.img_attn.qkv.weight"), 3, dim=0)
+        txt_q, txt_k, txt_v = torch.chunk(_pop_tensor(checkpoint, f"{src}.txt_attn.qkv.weight"), 3, dim=0)
+        img_q_bias, img_k_bias, img_v_bias = torch.chunk(_pop_tensor(checkpoint, f"{src}.img_attn.qkv.bias"), 3, dim=0)
+        txt_q_bias, txt_k_bias, txt_v_bias = torch.chunk(_pop_tensor(checkpoint, f"{src}.txt_attn.qkv.bias"), 3, dim=0)
+
+        converted[f"{dst}.attn.to_q.weight"] = img_q
+        converted[f"{dst}.attn.to_q.bias"] = img_q_bias
+        converted[f"{dst}.attn.to_k.weight"] = img_k
+        converted[f"{dst}.attn.to_k.bias"] = img_k_bias
+        converted[f"{dst}.attn.to_v.weight"] = img_v
+        converted[f"{dst}.attn.to_v.bias"] = img_v_bias
+
+        converted[f"{dst}.attn.add_q_proj.weight"] = txt_q
+        converted[f"{dst}.attn.add_q_proj.bias"] = txt_q_bias
+        converted[f"{dst}.attn.add_k_proj.weight"] = txt_k
+        converted[f"{dst}.attn.add_k_proj.bias"] = txt_k_bias
+        converted[f"{dst}.attn.add_v_proj.weight"] = txt_v
+        converted[f"{dst}.attn.add_v_proj.bias"] = txt_v_bias
+
+        converted[f"{dst}.attn.norm_q.weight"] = _pop_tensor(checkpoint, f"{src}.img_attn.norm.query_norm.scale")
+        converted[f"{dst}.attn.norm_k.weight"] = _pop_tensor(checkpoint, f"{src}.img_attn.norm.key_norm.scale")
+        converted[f"{dst}.attn.norm_added_q.weight"] = _pop_tensor(
+            checkpoint, f"{src}.txt_attn.norm.query_norm.scale"
+        )
+        converted[f"{dst}.attn.norm_added_k.weight"] = _pop_tensor(
+            checkpoint, f"{src}.txt_attn.norm.key_norm.scale"
+        )
+
+        converted[f"{dst}.img_mod.1.weight"] = _pop_tensor(checkpoint, f"{src}.img_mod.lin.weight")
+        converted[f"{dst}.img_mod.1.bias"] = _pop_tensor(checkpoint, f"{src}.img_mod.lin.bias")
+        converted[f"{dst}.txt_mod.1.weight"] = _pop_tensor(checkpoint, f"{src}.txt_mod.lin.weight")
+        converted[f"{dst}.txt_mod.1.bias"] = _pop_tensor(checkpoint, f"{src}.txt_mod.lin.bias")
+
+        converted[f"{dst}.ff.net.0.proj.weight"] = _pop_tensor(checkpoint, f"{src}.img_mlp.0.weight")
+        converted[f"{dst}.ff.net.0.proj.bias"] = _pop_tensor(checkpoint, f"{src}.img_mlp.0.bias")
+        converted[f"{dst}.ff.net.2.weight"] = _pop_tensor(checkpoint, f"{src}.img_mlp.2.weight")
+        converted[f"{dst}.ff.net.2.bias"] = _pop_tensor(checkpoint, f"{src}.img_mlp.2.bias")
+        converted[f"{dst}.ff_context.net.0.proj.weight"] = _pop_tensor(checkpoint, f"{src}.txt_mlp.0.weight")
+        converted[f"{dst}.ff_context.net.0.proj.bias"] = _pop_tensor(checkpoint, f"{src}.txt_mlp.0.bias")
+        converted[f"{dst}.ff_context.net.2.weight"] = _pop_tensor(checkpoint, f"{src}.txt_mlp.2.weight")
+        converted[f"{dst}.ff_context.net.2.bias"] = _pop_tensor(checkpoint, f"{src}.txt_mlp.2.bias")
+
+        converted[f"{dst}.attn.to_out.0.weight"] = _pop_tensor(checkpoint, f"{src}.img_attn.proj.weight")
+        converted[f"{dst}.attn.to_out.0.bias"] = _pop_tensor(checkpoint, f"{src}.img_attn.proj.bias")
+        converted[f"{dst}.attn.to_add_out.weight"] = _pop_tensor(checkpoint, f"{src}.txt_attn.proj.weight")
+        converted[f"{dst}.attn.to_add_out.bias"] = _pop_tensor(checkpoint, f"{src}.txt_attn.proj.bias")
+
+    converted["proj_out.weight"] = _pop_tensor(checkpoint, "final_layer.linear.weight")
+    converted["proj_out.bias"] = _pop_tensor(checkpoint, "final_layer.linear.bias")
+    converted["norm_out.linear.weight"] = _swap_shift_scale(
+        _pop_tensor(checkpoint, "final_layer.adaLN_modulation.1.weight")
+    )
+    converted["norm_out.linear.bias"] = _swap_shift_scale(_pop_tensor(checkpoint, "final_layer.adaLN_modulation.1.bias"))
+
+    ignored_prefixes = (
+        "llm_encoder.",
+        "pe_embedder.",
+        "final_layer.norm_final.",
+    )
+    remaining = [key for key in checkpoint if not key.startswith(ignored_prefixes)]
+    if remaining:
+        preview = ", ".join(sorted(remaining)[:20])
+        raise RuntimeError(f"存在未处理的 transformer 权重 key，需补映射: {preview}")
+
+    return converted
+
+
+def load_custom_transformer_into_pipe(pipe, transformer_ckpt: str):
+    checkpoint = _load_raw_transformer_checkpoint(transformer_ckpt)
+    converted = convert_vgo_transformer_to_diffusers(checkpoint)
+    missing, unexpected = pipe.transformer.load_state_dict(converted, strict=False)
+    if unexpected:
+        preview = ", ".join(unexpected[:20])
+        raise RuntimeError(f"加载自定义 transformer 时出现 unexpected keys: {preview}")
+    print(
+        f"[LOAD] custom transformer loaded from {transformer_ckpt} "
+        f"(converted_keys={len(converted)}, missing_after_override={len(missing)})"
+    )
+    if missing:
+        print(f"[LOAD] transformer keys kept from base repo: {', '.join(missing[:20])}")
 
 
 def read_keys(key_txt: str) -> List[str]:
@@ -176,6 +375,9 @@ class AttentionCollector:
             return torch.arange(n, dtype=torch.long)
         return torch.linspace(0, n - 1, steps=limit).long()
 
+    def _keep_all_tokens(self, n: int) -> torch.Tensor:
+        return torch.arange(n, dtype=torch.long)
+
     def _hook_fn(self, block_idx: int):
         def _fn(module, args, kwargs, output):
             hidden_states = kwargs.get("hidden_states")
@@ -202,7 +404,7 @@ class AttentionCollector:
                 attn = torch.softmax(scores, dim=-1)
                 attn = attn[0].detach().float().cpu()
                 q_idx = self._sample_tokens(attn.shape[1], self.max_q_tokens)
-                k_idx = self._sample_tokens(attn.shape[2], self.max_k_tokens)
+                k_idx = self._keep_all_tokens(attn.shape[2])
                 attn = attn[:, q_idx][:, :, k_idx]
                 self.maps[block_idx] = attn
                 self.meta[block_idx] = {
@@ -514,6 +716,27 @@ def _sample_flat_tensor(flat: torch.Tensor, max_points: int) -> torch.Tensor:
     return flat[idx]
 
 
+def _estimate_quantiles_from_flat_sample(
+    flat: torch.Tensor,
+    q_low: float,
+    q_high: float,
+    fallback_min: Optional[float] = None,
+    fallback_max: Optional[float] = None,
+) -> Tuple[float, float]:
+    arr = np.asarray(flat.reshape(-1).detach().cpu().numpy(), dtype=np.float32)
+    if arr.size <= 0:
+        raise RuntimeError("attention sample 为空")
+    vmin = float(np.quantile(arr, float(q_low)))
+    vmax = float(np.quantile(arr, float(q_high)))
+    if vmax <= vmin:
+        low = float(fallback_min if fallback_min is not None else float(arr.min()))
+        high = float(fallback_max if fallback_max is not None else float(arr.max()))
+        if high <= low:
+            high = low + 1e-6
+        return low, high
+    return vmin, vmax
+
+
 def _estimate_value_range_from_step_block_maps(
     step_block_maps: Dict[int, Any],
     q_low: float = 0.02,
@@ -525,11 +748,12 @@ def _estimate_value_range_from_step_block_maps(
     for step in steps:
         cur = _load_step_block_entry(step_block_maps[step])
         total_entries += max(1, len(cur))
-    per_entry_limit = max(2048, int(max_points) // max(total_entries, 1))
 
     samples: List[torch.Tensor] = []
     global_min = None
     global_max = None
+    remaining_budget = max(1, int(max_points))
+    remaining_entries = max(1, int(total_entries))
     for step in steps:
         cur = _load_step_block_entry(step_block_maps[step])
         for block_id in block_ids:
@@ -540,20 +764,25 @@ def _estimate_value_range_from_step_block_maps(
             cur_max = float(mat.max().item())
             global_min = cur_min if global_min is None else min(global_min, cur_min)
             global_max = cur_max if global_max is None else max(global_max, cur_max)
-            samples.append(_sample_flat_tensor(mat, per_entry_limit))
+            per_entry_limit = int(math.ceil(float(remaining_budget) / float(max(remaining_entries, 1))))
+            if per_entry_limit > 0:
+                sampled = _sample_flat_tensor(mat, per_entry_limit)
+                if int(sampled.numel()) > 0:
+                    samples.append(sampled)
+                    remaining_budget = max(0, int(remaining_budget) - int(sampled.numel()))
+            remaining_entries = max(0, int(remaining_entries) - 1)
 
     if not samples:
         raise RuntimeError("step-block attention 为空")
 
     flat = torch.cat(samples, dim=0)
-    vmin = float(torch.quantile(flat, float(q_low)).item())
-    vmax = float(torch.quantile(flat, float(q_high)).item())
-    if vmax <= vmin:
-        vmin = float(global_min if global_min is not None else flat.min().item())
-        vmax = float(global_max if global_max is not None else flat.max().item())
-        if vmax <= vmin:
-            vmax = vmin + 1e-6
-    return vmin, vmax
+    return _estimate_quantiles_from_flat_sample(
+        flat,
+        q_low=q_low,
+        q_high=q_high,
+        fallback_min=global_min,
+        fallback_max=global_max,
+    )
 
 
 def _estimate_value_range_from_tensor(
@@ -563,14 +792,13 @@ def _estimate_value_range_from_tensor(
     max_points: int = 1_000_000,
 ) -> Tuple[float, float]:
     flat = _sample_flat_tensor(tensor, max_points=max_points)
-    vmin = float(torch.quantile(flat, float(q_low)).item())
-    vmax = float(torch.quantile(flat, float(q_high)).item())
-    if vmax <= vmin:
-        vmin = float(tensor.min().item())
-        vmax = float(tensor.max().item())
-        if vmax <= vmin:
-            vmax = vmin + 1e-6
-    return vmin, vmax
+    return _estimate_quantiles_from_flat_sample(
+        flat,
+        q_low=q_low,
+        q_high=q_high,
+        fallback_min=float(tensor.min().item()),
+        fallback_max=float(tensor.max().item()),
+    )
 
 
 def pack_step_block_maps(step_block_maps: Dict[int, Any]) -> Tuple[torch.Tensor, torch.Tensor, List[int], List[int]]:
@@ -846,6 +1074,28 @@ def save_full_map(
     plt.close(fig)
 
 
+def _emit_progress(
+    progress_queue,
+    status: str,
+    key: str,
+    worker_idx: int,
+    gpu: int,
+):
+    if progress_queue is None:
+        return
+    try:
+        progress_queue.put(
+            {
+                "status": str(status),
+                "key": str(key),
+                "worker_idx": int(worker_idx),
+                "gpu": int(gpu),
+            }
+        )
+    except Exception:
+        return
+
+
 def run_inference_worker(
     worker_idx: int,
     gpu: int,
@@ -853,7 +1103,9 @@ def run_inference_worker(
     prompts: Dict[str, str],
     keys: List[str],
     key_to_index: Dict[str, int],
-) -> Tuple[int, int]:
+    progress_queue=None,
+    show_local_progress: bool = False,
+) -> Tuple[int, int, int]:
     use_cuda = torch.cuda.is_available() and gpu >= 0
     if use_cuda:
         torch.cuda.set_device(gpu)
@@ -864,180 +1116,217 @@ def run_inference_worker(
         dtype = torch.float32
     from diffusers import QwenImageEditPlusPipeline
 
-    pipe = QwenImageEditPlusPipeline.from_pretrained(args.model_name, torch_dtype=dtype).to(device)
-    pipe.set_progress_bar_config(disable=False)
+    pipe = QwenImageEditPlusPipeline.from_pretrained(args.model_name, torch_dtype=dtype)
+    if str(getattr(args, "transformer_ckpt", "")).strip():
+        load_custom_transformer_into_pipe(pipe, str(args.transformer_ckpt).strip())
+    pipe = pipe.to(device)
+    pipe.set_progress_bar_config(disable=not bool(args.show_inner_progress))
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
     done = 0
     skipped = 0
+    failed = 0
+    pbar: Optional[tqdm] = None
+    if show_local_progress:
+        pbar = tqdm(total=len(keys), desc=f"total gpu{gpu}", dynamic_ncols=True)
+
     for key in keys:
-        if key not in prompts:
-            print(f"[SKIP][worker={worker_idx}][gpu={gpu}] key不在prompts_json中，已跳过: {key}")
-            skipped += 1
-            continue
-        key_attn_dir = out_root / f"{key}_attn"
-        out_img = out_root / f"{key}.png"
-        if (not args.overwrite) and _has_complete_attention_outputs(
-            key_attn_dir,
-            out_img,
-            args.save_format,
-            save_attn_tensor=bool(args.save_attn_tensor),
-        ):
-            print(f"[SKIP][worker={worker_idx}][gpu={gpu}] 已存在完整输出: {key_attn_dir}")
-            skipped += 1
-            continue
-        if args.overwrite:
-            if key_attn_dir.exists():
-                shutil.rmtree(key_attn_dir, ignore_errors=True)
-            if out_img.exists():
-                out_img.unlink()
-        cref_path = Path(args.cref_dir) / f"{key}.png"
-        sref_path = Path(args.sref_dir) / f"{key}.png"
-        if not cref_path.exists() or not sref_path.exists():
-            print(f"[SKIP][worker={worker_idx}][gpu={gpu}] 图片缺失: key={key} cref={cref_path.exists()} sref={sref_path.exists()}")
-            skipped += 1
-            continue
+        status = "failed"
+        collector = None
+        step_cache_dir: Optional[Path] = None
+        try:
+            if key not in prompts:
+                print(f"[SKIP][worker={worker_idx}][gpu={gpu}] key不在prompts_json中，已跳过: {key}")
+                skipped += 1
+                status = "skipped"
+                continue
+            key_attn_dir = out_root / f"{key}_attn"
+            out_img = out_root / f"{key}.png"
+            if (not args.overwrite) and _has_complete_attention_outputs(
+                key_attn_dir,
+                out_img,
+                args.save_format,
+                save_attn_tensor=bool(args.save_attn_tensor),
+            ):
+                print(f"[SKIP][worker={worker_idx}][gpu={gpu}] 已存在完整输出: {key_attn_dir}")
+                skipped += 1
+                status = "skipped"
+                continue
+            if args.overwrite:
+                if key_attn_dir.exists():
+                    shutil.rmtree(key_attn_dir, ignore_errors=True)
+                if out_img.exists():
+                    out_img.unlink()
+            cref_path = Path(args.cref_dir) / f"{key}.png"
+            sref_path = Path(args.sref_dir) / f"{key}.png"
+            if not cref_path.exists() or not sref_path.exists():
+                print(f"[SKIP][worker={worker_idx}][gpu={gpu}] 图片缺失: key={key} cref={cref_path.exists()} sref={sref_path.exists()}")
+                skipped += 1
+                status = "skipped"
+                continue
 
-        prompt = prompts[key]
-        cref = load_rgb(str(cref_path))
-        sref = load_rgb(str(sref_path))
-        images = [cref, sref]
-        ref_labels = [x.strip() for x in str(args.ref_labels).split(",") if x.strip()]
-        if len(ref_labels) < len(images):
-            ref_labels += [f"ref{i}" for i in range(len(ref_labels), len(images))]
-        ref_labels = ref_labels[: len(images)]
+            prompt = prompts[key]
+            cref = load_rgb(str(cref_path))
+            sref = load_rgb(str(sref_path))
+            images = [cref, sref]
+            ref_labels = [x.strip() for x in str(args.ref_labels).split(",") if x.strip()]
+            if len(ref_labels) < len(images):
+                ref_labels += [f"ref{i}" for i in range(len(ref_labels), len(images))]
+            ref_labels = ref_labels[: len(images)]
 
-        max_q_tokens = int(args.max_q_tokens) if int(args.max_q_tokens) > 0 else int(args.max_tokens)
-        max_k_tokens = int(args.max_k_tokens) if int(args.max_k_tokens) > 0 else int(args.max_tokens)
-        collector = AttentionCollector(max_q_tokens=max_q_tokens, max_k_tokens=max_k_tokens)
-        text_tokens_est = 0
-        if hasattr(pipe, "tokenizer") and pipe.tokenizer is not None:
-            try:
-                text_tokens_est = int(pipe.tokenizer(prompt, return_tensors="pt").input_ids.shape[1])
-            except Exception:
-                text_tokens_est = 0
-        if hasattr(pipe, "transformer") and pipe.transformer is not None:
-            collector.register(pipe.transformer)
-        else:
-            collector.register(pipe.unet if hasattr(pipe, "unet") else pipe)
+            max_q_tokens = int(args.max_q_tokens) if int(args.max_q_tokens) > 0 else int(args.max_tokens)
+            max_k_tokens = int(args.max_k_tokens) if int(args.max_k_tokens) > 0 else int(args.max_tokens)
+            collector = AttentionCollector(max_q_tokens=max_q_tokens, max_k_tokens=max_k_tokens)
+            text_tokens_est = 0
+            if hasattr(pipe, "tokenizer") and pipe.tokenizer is not None:
+                try:
+                    text_tokens_est = int(pipe.tokenizer(prompt, return_tensors="pt").input_ids.shape[1])
+                except Exception:
+                    text_tokens_est = 0
+            if hasattr(pipe, "transformer") and pipe.transformer is not None:
+                collector.register(pipe.transformer)
+            else:
+                collector.register(pipe.unet if hasattr(pipe, "unet") else pipe)
 
-        seed_offset = int(key_to_index.get(key, 0))
-        generator = torch.Generator(device=device).manual_seed(int(args.seed) + seed_offset)
-        step_block_maps: Dict[int, Any] = {}
-        step_cache_dir = key_attn_dir / "_step_block_cache"
-        if step_cache_dir.exists():
-            shutil.rmtree(step_cache_dir, ignore_errors=True)
+            seed_offset = int(key_to_index.get(key, 0))
+            generator = torch.Generator(device=device).manual_seed(int(args.seed) + seed_offset)
+            step_block_maps: Dict[int, Any] = {}
+            step_cache_dir = key_attn_dir / "_step_block_cache"
+            if step_cache_dir.exists():
+                shutil.rmtree(step_cache_dir, ignore_errors=True)
 
-        def on_step_end(_pipe, step, timestep, callback_kwargs):
-            step_i = int(step)
-            if step_i % max(int(args.step_stride), 1) != 0:
+            def on_step_end(_pipe, step, timestep, callback_kwargs):
+                step_i = int(step)
+                if step_i % max(int(args.step_stride), 1) != 0:
+                    return callback_kwargs
+                cur = {}
+                for b in sorted(collector.maps.keys()):
+                    if b % max(int(args.block_stride), 1) != 0:
+                        continue
+                    cur[b] = aggregate_head_map(collector.maps[b], head_mode=args.aggregate_head).clone()
+                if cur:
+                    step_cache_dir.mkdir(parents=True, exist_ok=True)
+                    cache_path = step_cache_dir / f"step_{step_i:04d}.pt"
+                    torch.save(cur, cache_path)
+                    step_block_maps[step_i] = cache_path
                 return callback_kwargs
-            cur = {}
-            for b in sorted(collector.maps.keys()):
-                if b % max(int(args.block_stride), 1) != 0:
-                    continue
-                cur[b] = aggregate_head_map(collector.maps[b], head_mode=args.aggregate_head).clone()
-            if cur:
-                step_cache_dir.mkdir(parents=True, exist_ok=True)
-                cache_path = step_cache_dir / f"step_{step_i:04d}.pt"
-                torch.save(cur, cache_path)
-                step_block_maps[step_i] = cache_path
-            return callback_kwargs
 
-        with torch.inference_mode():
-            out = pipe(
-                image=images,
-                prompt=prompt,
-                negative_prompt=args.negative_prompt,
-                width=cref.size[0],
-                height=cref.size[1],
-                num_inference_steps=int(args.steps),
-                true_cfg_scale=float(args.true_cfg_scale),
-                generator=generator,
-                callback_on_step_end=on_step_end,
-            ).images[0]
-        collector.remove()
+            with torch.inference_mode():
+                out = pipe(
+                    image=images,
+                    prompt=prompt,
+                    negative_prompt=args.negative_prompt,
+                    width=cref.size[0],
+                    height=cref.size[1],
+                    num_inference_steps=int(args.steps),
+                    true_cfg_scale=float(args.true_cfg_scale),
+                    generator=generator,
+                    callback_on_step_end=on_step_end,
+                ).images[0]
+            collector.remove()
 
-        out.save(out_img)
-        if len(step_block_maps) == 0:
-            cur = {}
-            for b in sorted(collector.maps.keys()):
-                if b % max(int(args.block_stride), 1) != 0:
-                    continue
-                cur[b] = aggregate_head_map(collector.maps[b], head_mode=args.aggregate_head).clone()
-            if cur:
-                step_block_maps[0] = cur
-        out_map = out_root / f"{key}_attn" / f"attention_step_block_grid.{args.save_format}"
-        save_step_block_grid(
-            step_block_maps=step_block_maps,
-            out_path=out_map,
-            ref_labels=ref_labels,
-            image_dpi=int(args.image_dpi),
-            save_format=args.save_format,
-            head_mode=args.aggregate_head,
-            step_stride=max(int(args.step_stride), 1),
-            block_stride=max(int(args.block_stride), 1),
-            panel_size=float(args.panel_size),
-            attn_cmap=str(args.attn_cmap),
-            attn_gamma=float(args.attn_gamma),
-            high_attn_quantile=float(args.high_attn_quantile),
-            high_attn_contour_color=str(args.high_attn_contour_color),
-            high_attn_contour_width=float(args.high_attn_contour_width),
-            region_alpha=float(args.region_alpha),
-            boundary_linewidth=float(args.boundary_linewidth),
-            q_tokens_full=int(collector.meta.get(sorted(collector.meta.keys())[0], {}).get("q_tokens_full", 0)) if collector.meta else 0,
-            k_tokens_full=int(collector.meta.get(sorted(collector.meta.keys())[0], {}).get("k_tokens_full", 0)) if collector.meta else 0,
-            q_sample_indices=[int(x) for x in collector.meta.get(sorted(collector.meta.keys())[0], {}).get("q_sample_indices", [])] if collector.meta else [],
-            k_sample_indices=[int(x) for x in collector.meta.get(sorted(collector.meta.keys())[0], {}).get("k_sample_indices", [])] if collector.meta else [],
-            has_encoder=bool(collector.meta.get(sorted(collector.meta.keys())[0], {}).get("has_encoder", False)) if collector.meta else False,
-            text_tokens_est=int(text_tokens_est),
-        )
-        if args.save_attn_tensor:
-            out_tensor = out_root / f"{key}_attn" / "attention_step_block_grid.pt"
-            save_step_block_tensor(
+            out.save(out_img)
+            if len(step_block_maps) == 0:
+                cur = {}
+                for b in sorted(collector.maps.keys()):
+                    if b % max(int(args.block_stride), 1) != 0:
+                        continue
+                    cur[b] = aggregate_head_map(collector.maps[b], head_mode=args.aggregate_head).clone()
+                if cur:
+                    step_block_maps[0] = cur
+            out_map = out_root / f"{key}_attn" / f"attention_step_block_grid.{args.save_format}"
+            save_step_block_grid(
                 step_block_maps=step_block_maps,
-                out_path=out_tensor,
-                key=key,
-                prompt=prompt,
+                out_path=out_map,
                 ref_labels=ref_labels,
-                aggregate_head=str(args.aggregate_head),
+                image_dpi=int(args.image_dpi),
+                save_format=args.save_format,
+                head_mode=args.aggregate_head,
                 step_stride=max(int(args.step_stride), 1),
                 block_stride=max(int(args.block_stride), 1),
+                panel_size=float(args.panel_size),
+                attn_cmap=str(args.attn_cmap),
+                attn_gamma=float(args.attn_gamma),
+                high_attn_quantile=float(args.high_attn_quantile),
+                high_attn_contour_color=str(args.high_attn_contour_color),
+                high_attn_contour_width=float(args.high_attn_contour_width),
+                region_alpha=float(args.region_alpha),
+                boundary_linewidth=float(args.boundary_linewidth),
                 q_tokens_full=int(collector.meta.get(sorted(collector.meta.keys())[0], {}).get("q_tokens_full", 0)) if collector.meta else 0,
                 k_tokens_full=int(collector.meta.get(sorted(collector.meta.keys())[0], {}).get("k_tokens_full", 0)) if collector.meta else 0,
                 q_sample_indices=[int(x) for x in collector.meta.get(sorted(collector.meta.keys())[0], {}).get("q_sample_indices", [])] if collector.meta else [],
                 k_sample_indices=[int(x) for x in collector.meta.get(sorted(collector.meta.keys())[0], {}).get("k_sample_indices", [])] if collector.meta else [],
                 has_encoder=bool(collector.meta.get(sorted(collector.meta.keys())[0], {}).get("has_encoder", False)) if collector.meta else False,
                 text_tokens_est=int(text_tokens_est),
-                collector_meta=collector.meta,
             )
-        if collector.meta:
-            sample_block = sorted(collector.meta.keys())[0]
-            token_summary = out_root / f"{key}_attn" / "token_layout_summary.txt"
-            save_token_layout_summary(
-                out_path=token_summary,
-                key=key,
-                prompt=prompt,
-                ref_labels=ref_labels,
-                collector=collector,
-                sample_block=sample_block,
-                step_block_maps=step_block_maps,
-                tokenizer=getattr(pipe, "tokenizer", None),
-            )
-        done += 1
-        print(f"[SUMMARY][worker={worker_idx}][gpu={gpu}] key={key} generated_image={out_img}")
-        print(f"[SUMMARY][worker={worker_idx}][gpu={gpu}] key={key} fullmap={out_map}")
-        if args.save_attn_tensor:
-            print(f"[SUMMARY][worker={worker_idx}][gpu={gpu}] key={key} attn_tensor={out_root / f'{key}_attn' / 'attention_step_block_grid.pt'}")
-        summary_path = out_root / f"{key}_attn" / "token_layout_summary.txt"
-        if summary_path.exists():
-            print(f"[SUMMARY][worker={worker_idx}][gpu={gpu}] key={key} token_layout={summary_path}")
-        print(f"[SELF-CHECK][worker={worker_idx}][gpu={gpu}] key={key} {'PASS' if out_map.exists() else 'FAIL'}")
-        if step_cache_dir.exists():
-            shutil.rmtree(step_cache_dir, ignore_errors=True)
+            if args.save_attn_tensor:
+                out_tensor = out_root / f"{key}_attn" / "attention_step_block_grid.pt"
+                save_step_block_tensor(
+                    step_block_maps=step_block_maps,
+                    out_path=out_tensor,
+                    key=key,
+                    prompt=prompt,
+                    ref_labels=ref_labels,
+                    aggregate_head=str(args.aggregate_head),
+                    step_stride=max(int(args.step_stride), 1),
+                    block_stride=max(int(args.block_stride), 1),
+                    q_tokens_full=int(collector.meta.get(sorted(collector.meta.keys())[0], {}).get("q_tokens_full", 0)) if collector.meta else 0,
+                    k_tokens_full=int(collector.meta.get(sorted(collector.meta.keys())[0], {}).get("k_tokens_full", 0)) if collector.meta else 0,
+                    q_sample_indices=[int(x) for x in collector.meta.get(sorted(collector.meta.keys())[0], {}).get("q_sample_indices", [])] if collector.meta else [],
+                    k_sample_indices=[int(x) for x in collector.meta.get(sorted(collector.meta.keys())[0], {}).get("k_sample_indices", [])] if collector.meta else [],
+                    has_encoder=bool(collector.meta.get(sorted(collector.meta.keys())[0], {}).get("has_encoder", False)) if collector.meta else False,
+                    text_tokens_est=int(text_tokens_est),
+                    collector_meta=collector.meta,
+                )
+            if collector.meta:
+                sample_block = sorted(collector.meta.keys())[0]
+                token_summary = out_root / f"{key}_attn" / "token_layout_summary.txt"
+                save_token_layout_summary(
+                    out_path=token_summary,
+                    key=key,
+                    prompt=prompt,
+                    ref_labels=ref_labels,
+                    collector=collector,
+                    sample_block=sample_block,
+                    step_block_maps=step_block_maps,
+                    tokenizer=getattr(pipe, "tokenizer", None),
+                )
+            done += 1
+            status = "done"
+            print(f"[SUMMARY][worker={worker_idx}][gpu={gpu}] key={key} generated_image={out_img}")
+            print(f"[SUMMARY][worker={worker_idx}][gpu={gpu}] key={key} fullmap={out_map}")
+            if args.save_attn_tensor:
+                print(f"[SUMMARY][worker={worker_idx}][gpu={gpu}] key={key} attn_tensor={out_root / f'{key}_attn' / 'attention_step_block_grid.pt'}")
+            summary_path = out_root / f"{key}_attn" / "token_layout_summary.txt"
+            if summary_path.exists():
+                print(f"[SUMMARY][worker={worker_idx}][gpu={gpu}] key={key} token_layout={summary_path}")
+            print(f"[SELF-CHECK][worker={worker_idx}][gpu={gpu}] key={key} {'PASS' if out_map.exists() else 'FAIL'}")
+        except Exception as exc:
+            failed += 1
+            status = "failed"
+            print(f"[FAIL][worker={worker_idx}][gpu={gpu}] key={key} {type(exc).__name__}: {exc}")
+        finally:
+            if collector is not None:
+                try:
+                    collector.remove()
+                except Exception:
+                    pass
+            if step_cache_dir is not None and step_cache_dir.exists():
+                shutil.rmtree(step_cache_dir, ignore_errors=True)
+            if use_cuda:
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            _emit_progress(progress_queue, status=status, key=key, worker_idx=worker_idx, gpu=gpu)
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix(done=done, skip=skipped, fail=failed)
 
-    return done, skipped
+    if pbar is not None:
+        pbar.close()
+    return done, skipped, failed
 
 
 def main():
@@ -1055,13 +1344,15 @@ def main():
         gpu_list = [0]
 
     if len(gpu_list) <= 1 or not torch.cuda.is_available():
-        done, skipped = run_inference_worker(
+        done, skipped, failed = run_inference_worker(
             worker_idx=0,
             gpu=int(gpu_list[0]),
             args=args,
             prompts=prompts,
             keys=keys,
             key_to_index=key_to_index,
+            progress_queue=None,
+            show_local_progress=True,
         )
     else:
         chunks = split_keys_round_robin(keys, len(gpu_list))
@@ -1071,12 +1362,59 @@ def main():
                 continue
             tasks.append((worker_idx, int(gpu), args, prompts, sub_keys, key_to_index))
         mp_ctx = mp.get_context("spawn")
+        manager = mp_ctx.Manager()
+        progress_queue = manager.Queue()
+        progress_stats = {"done": 0, "skipped": 0, "failed": 0}
         with mp_ctx.Pool(processes=len(tasks)) as pool:
-            results = pool.starmap(run_inference_worker, tasks)
+            async_results = [
+                pool.apply_async(
+                    run_inference_worker,
+                    args=task,
+                    kwds={"progress_queue": progress_queue, "show_local_progress": False},
+                )
+                for task in tasks
+            ]
+            with tqdm(total=len(keys), desc="total", dynamic_ncols=True) as pbar:
+                processed = 0
+                while processed < len(keys):
+                    try:
+                        event = progress_queue.get(timeout=1.0)
+                        processed += 1
+                        status = str(event.get("status", "failed"))
+                        if status not in progress_stats:
+                            progress_stats[status] = 0
+                        progress_stats[status] += 1
+                        pbar.update(1)
+                        pbar.set_postfix(
+                            done=progress_stats.get("done", 0),
+                            skip=progress_stats.get("skipped", 0),
+                            fail=progress_stats.get("failed", 0),
+                        )
+                    except Empty:
+                        if all(res.ready() for res in async_results):
+                            break
+                while processed < len(keys):
+                    try:
+                        event = progress_queue.get_nowait()
+                    except Empty:
+                        break
+                    processed += 1
+                    status = str(event.get("status", "failed"))
+                    if status not in progress_stats:
+                        progress_stats[status] = 0
+                    progress_stats[status] += 1
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        done=progress_stats.get("done", 0),
+                        skip=progress_stats.get("skipped", 0),
+                        fail=progress_stats.get("failed", 0),
+                    )
+            results = [res.get() for res in async_results]
         done = int(sum(x[0] for x in results))
         skipped = int(sum(x[1] for x in results))
+        failed = int(sum(x[2] for x in results))
 
-    print(f"[FINAL] done={done} skipped={skipped} total={len(keys)}")
+    print(f"[FINAL] done={done} skipped={skipped} failed={failed} total={len(keys)}")
 
 
 if __name__ == "__main__":

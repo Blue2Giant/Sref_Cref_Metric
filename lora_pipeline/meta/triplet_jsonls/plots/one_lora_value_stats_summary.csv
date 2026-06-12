@@ -1,0 +1,7 @@
+base_model,kind,key_count,avg_value_count,median_value_count,min_value_count,max_value_count,total_value_count
+flux,content,91,9.164835164835164,7.0,2,49,834
+flux,style,1460,9.111643835616439,7.0,1,40,13303
+illustrious,content,799,15.687108886107634,16.0,3,28,12534
+illustrious,style,191,9.361256544502618,9.0,1,19,1788
+qwen,content,19,13.263157894736842,9.0,4,40,252
+qwen,style,53,8.0,8.0,2,13,424

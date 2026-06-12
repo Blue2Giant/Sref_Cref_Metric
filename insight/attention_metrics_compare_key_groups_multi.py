@@ -11,11 +11,9 @@ By default, every `*.txt` file under `--cohort-dir` becomes one cohort:
 
 Example:
 python /data/benchmark_metrics/insight/attention_metrics_compare_key_groups_multi.py \
-    --root-dir /mnt/jfs/qwen-edit-attn-fullmap-keycolor-save-kfull-1-1 \
-    --output-dir /data/benchmark_metrics/logs/qwen_attn_key_group_compare_multi-1-1 \
-    --cohort-dir /data/benchmark_metrics/insight/key_folder \
-    --summary-csv /data/benchmark_metrics/logs/attention_metrics_summary.csv
-
+    --root-dir /mnt/jfs/logs/ours_analysis_key \
+    --output-dir /data/benchmark_metrics/logs/ours_key_group_compare_multi-1-1 \
+    --cohort-dir /data/benchmark_metrics/insight/key_folder/ours \
 
 
 """

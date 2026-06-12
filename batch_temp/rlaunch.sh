@@ -2,9 +2,9 @@
 
 DEFAULT_GROUPS=("l40s_yangtong" "buffer" "maintain")
 DEFAULT_GROUP="buffer"
-DEFAULT_GPU=8
-DEFAULT_CPU=64
-DEFAULT_MEMORY=1000000
+DEFAULT_GPU=1
+DEFAULT_CPU=50
+DEFAULT_MEMORY=500000
 
 show_help() {
     echo "Usage: $0 [-G group] [-g gpu] [-c cpu] [-m memory]"
@@ -57,6 +57,7 @@ while true; do
         --negative-tags gpu-h100-0452.host.platform.shaipower.com \
         --mount=juicefs+s3://oss.i.shaipower.com/lanjinghong-data:/mnt/jfs \
         --i-know-i-am-wasting-resource=false \
+        --preemptible=yes \
         --custom-resources rdma/mlnx_shared=8 --entrypoint="" -- bash   
     echo "rlaunch 任务已退出，3秒后重试..."
     sleep 3

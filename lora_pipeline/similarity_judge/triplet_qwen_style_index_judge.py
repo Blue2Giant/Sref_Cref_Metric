@@ -18,6 +18,7 @@ import requests
 from PIL import Image
 from tqdm import tqdm
 from megfile.smart import smart_exists
+import qwen_judge_runtime as runtime
 
 
 G_TASKS: List[Dict[str, Any]] = []
@@ -25,11 +26,14 @@ G_ARGS = None
 API_KEY = "EMPTY"
 MODEL = "Qwen3-VL-30B-A3B-Instruct"
 BASE_URL = "http://10.201.19.61:22002/v1"
-TIMEOUT = 720
+DEFAULT_TIMEOUT = 720.0
+TIMEOUT = DEFAULT_TIMEOUT
 RETRY_EXHAUSTED_REASON = "API 重试耗尽"
 RESIZE_MAX_SIDE = 1024
 JPEG_QUALITY = 85
 Image.MAX_IMAGE_PIXELS = None
+G_RUNTIME_STATS = runtime.WorkerRuntimeStats()
+G_IMAGE_CACHE = runtime.ImageDataUriCache(max_items=0)
 STYLE_SYSTEM_PROMPT = (
     "你是一个只关注“画风/视觉风格”的资深评审。\n"
     "你只评估视觉表现形式（媒介感、材质感、线条/笔触、色彩与调色、光影与对比、渲染/后期、画面噪声与颗粒、细节表达方式）。\n"
@@ -141,6 +145,24 @@ def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def configure_worker_runtime(args_obj: Any = None):
+    global G_ARGS, G_RUNTIME_STATS, G_IMAGE_CACHE, TIMEOUT
+    G_ARGS = args_obj
+    G_RUNTIME_STATS = runtime.WorkerRuntimeStats()
+    cache_size = int(getattr(args_obj, "image_cache_size", 0)) if args_obj is not None else 0
+    G_IMAGE_CACHE = runtime.ImageDataUriCache(max_items=cache_size)
+    timeout_sec = float(getattr(args_obj, "request_timeout_sec", DEFAULT_TIMEOUT)) if args_obj is not None else DEFAULT_TIMEOUT
+    TIMEOUT = max(1.0, timeout_sec)
+
+
+def get_runtime_stats_snapshot() -> Dict[str, float]:
+    return G_RUNTIME_STATS.snapshot()
+
+
+def diff_runtime_stats(before: Dict[str, float], after: Dict[str, float]) -> Dict[str, float]:
+    return runtime.diff_runtime_stats(before, after)
+
+
 def _read_bytes(path: str) -> Optional[bytes]:
     try:
         with open(path, "rb") as f:
@@ -173,14 +195,24 @@ def _resize_keep_long_side(img: Image.Image, max_side: int) -> Image.Image:
 
 
 def get_image_data_uri(path: str) -> Optional[str]:
-    img = _load_image(path)
+    cache_key = str(path).strip()
+    cached = G_IMAGE_CACHE.get(cache_key)
+    if cached is not None:
+        G_RUNTIME_STATS.record_cache_hit()
+        return cached
+    G_RUNTIME_STATS.record_cache_miss()
+    img = _load_image(cache_key)
     if img is None:
+        G_RUNTIME_STATS.record_image_encode_failure()
         return None
     img = _resize_keep_long_side(img, RESIZE_MAX_SIDE)
     buf = BytesIO()
     img.save(buf, format="JPEG", quality=JPEG_QUALITY)
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/jpeg;base64,{b64}"
+    data_uri = f"data:image/jpeg;base64,{b64}"
+    G_IMAGE_CACHE.put(cache_key, data_uri)
+    G_RUNTIME_STATS.record_image_encoded()
+    return data_uri
 
 
 def strip_code_fences(s: str) -> str:
@@ -235,6 +267,7 @@ def call_qwen_chat_with_retry(
     }
     total_attempts = max(0, int(retry_times)) + 1
     for attempt in range(1, total_attempts + 1):
+        started_at = time.time()
         try:
             resp = requests.post(
                 BASE_URL.rstrip("/") + "/chat/completions",
@@ -243,11 +276,14 @@ def call_qwen_chat_with_retry(
                 timeout=TIMEOUT,
             )
             resp.raise_for_status()
+            G_RUNTIME_STATS.record_api(ok=True, elapsed_sec=time.time() - started_at)
             return resp.json()
         except Exception as e:
+            G_RUNTIME_STATS.record_api(ok=False, elapsed_sec=time.time() - started_at)
             log(f"[Err] API 请求出错(第 {attempt}/{total_attempts} 次): {e}")
             if attempt < total_attempts:
                 time.sleep(retry_delay)
+    G_RUNTIME_STATS.record_retry_exhausted()
     return None
 
 
@@ -372,10 +408,12 @@ def judge_pair_voting(
     judge_times: int,
     min_true: int,
 ) -> Tuple[Optional[bool], Dict[str, Any], bool]:
+    judge_times = max(1, int(judge_times))
+    min_true = max(0, int(min_true))
     trials: List[Dict[str, Any]] = []
     good_true = 0
     retry_exhausted = False
-    for i in range(1, int(judge_times) + 1):
+    for i in range(1, judge_times + 1):
         pred, reason, conf = direct_judge_images_generic(path_a, path_b, system_prompt, user_instruction)
         if pred is None and reason == RETRY_EXHAUSTED_REASON:
             retry_exhausted = True
@@ -384,9 +422,34 @@ def judge_pair_voting(
         if is_valid and pred is True:
             good_true += 1
         trials.append({"call": i, "pred": pred, "conf": conf, "valid": is_valid, "reason": reason})
+        remaining_trials = judge_times - i
+        if good_true >= min_true:
+            return (
+                True,
+                {
+                    "status": "ok",
+                    "trials": trials,
+                    "good_true": good_true,
+                    "passed": True,
+                    "early_stop": "vote_threshold_hit",
+                },
+                False,
+            )
+        if good_true + remaining_trials < min_true:
+            return (
+                False,
+                {
+                    "status": "ok",
+                    "trials": trials,
+                    "good_true": good_true,
+                    "passed": False,
+                    "early_stop": "vote_threshold_unreachable",
+                },
+                False,
+            )
     if retry_exhausted:
         return None, {"status": "retry_exhausted", "trials": trials, "good_true": good_true}, True
-    passed = good_true >= int(min_true)
+    passed = good_true >= min_true
     return passed, {"status": "ok", "trials": trials, "good_true": good_true, "passed": passed}, False
 
 

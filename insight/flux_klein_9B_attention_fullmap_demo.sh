@@ -54,7 +54,7 @@ if [ "$save_attn_tensor" = "1" ]; then
   extra_args="$extra_args --save-attn-tensor"
 fi
 
-python /data/benchmark_metrics/sref_cref/flux_klein_9B_attention_fullmap.py \
+python /data/benchmark_metrics/insight/flux_klein_9B_attention_fullmap.py \
   --prompts_json "$sref_root/prompts.json" \
   --cref_dir "$sref_root/cref" \
   --sref_dir "$sref_root/sref" \

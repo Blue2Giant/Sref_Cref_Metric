@@ -102,17 +102,23 @@ def parse_args():
         help='Comma-separated ids to run, e.g. "000015,000010". Empty = all.',
     )
 
-    # Resize control
+    # Size control
     p.add_argument(
         "--no_resize_cref",
         action="store_true",
-        help="Disable resizing cref to closest PREFERRED_KONTEXT_RESOLUTIONS aspect ratio.",
+        help="Disable resizing reference images to closest PREFERRED_KONTEXT_RESOLUTIONS aspect ratio.",
+    )
+    p.add_argument(
+        "--output_resolution",
+        type=str,
+        default="",
+        help='Set generated/noise resolution as "WIDTHxHEIGHT", e.g. "1024x1024". Reference images still use bucket resize.',
     )
     p.add_argument(
         "--input_resolution",
         type=str,
         default="",
-        help='Override input resolution as "WIDTHxHEIGHT", e.g. "1024x1024".',
+        help='Deprecated alias for --output_resolution. It no longer forces reference images to this size.',
     )
 
     p.add_argument(
@@ -160,6 +166,18 @@ def _lanczos():
     return getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
 
 
+def parse_resolution(spec: str) -> Tuple[int, int]:
+    text = str(spec).strip().lower()
+    if "x" not in text:
+        raise ValueError(f"invalid resolution {spec!r}; expected WIDTHxHEIGHT")
+    w_str, h_str = text.split("x", 1)
+    width = int(w_str)
+    height = int(h_str)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"invalid resolution {spec!r}; width/height must be positive")
+    return width, height
+
+
 def resize_cref(cref: Image.Image) -> Tuple[Image.Image, Tuple[int, int]]:
     cref_w, cref_h = cref.size  # PIL: (W,H)
     aspect_ratio = cref_w / float(cref_h)
@@ -173,6 +191,17 @@ def resize_cref(cref: Image.Image) -> Tuple[Image.Image, Tuple[int, int]]:
 
     resized = cref.resize((target_w, target_h), resample=_lanczos())
     return resized, (target_w, target_h)
+
+
+def resolve_output_size(args) -> Optional[Tuple[int, int]]:
+    """Return requested generated/noise size. --input_resolution is kept as a deprecated alias."""
+    output_resolution = getattr(args, "output_resolution", "") or ""
+    input_resolution = getattr(args, "input_resolution", "") or ""
+    if output_resolution:
+        return parse_resolution(output_resolution)
+    if input_resolution:
+        return parse_resolution(input_resolution)
+    return None
 
 
 def compute_seed(base_seed: int, seed_strategy: str, k: str) -> int:
@@ -206,9 +235,12 @@ def worker(rank: int, gpu_id: int, keys: List[str], prompts: Dict[str, str], arg
 
     torch_dtype = choose_torch_dtype(device)
 
-    from diffusers import Flux2KleinPipeline
+    try:
+        from diffusers import Flux2KleinPipeline as FluxPipelineCls
+    except ImportError:
+        from diffusers import Flux2Pipeline as FluxPipelineCls
 
-    pipe = Flux2KleinPipeline.from_pretrained(args.model_name, torch_dtype=torch_dtype)
+    pipe = FluxPipelineCls.from_pretrained(args.model_name, torch_dtype=torch_dtype)
 
 
     if device.type == "cuda" and args.cpu_offload:
@@ -228,6 +260,14 @@ def worker(rank: int, gpu_id: int, keys: List[str], prompts: Dict[str, str], arg
     if args.save_jsonl:
         meta_f = open(out_dir / f"metadata.rank{rank}.jsonl", "a", encoding="utf-8")
 
+    requested_output_size = resolve_output_size(args)
+    if getattr(args, "input_resolution", "") and not getattr(args, "output_resolution", ""):
+        print(
+            f"[WARN][rank{rank}] --input_resolution is deprecated; treating it as generated/noise "
+            f"--output_resolution={args.input_resolution}. Reference images are bucket-resized.",
+            flush=True,
+        )
+
     missing = 0
     skipped = 0
 
@@ -240,9 +280,13 @@ def worker(rank: int, gpu_id: int, keys: List[str], prompts: Dict[str, str], arg
 
             prompt = prompts[k]
 
-            # decide sizes and images
+            # decide generated/noise size and reference-image sizes independently.
+            # When --output_resolution is specified, it controls only the sampled noise/output canvas.
+            # Reference images are resized with the Kontext bucket logic below, not forced to output_size.
             image_list: Optional[List[Image.Image]] = None
-            content_size = (1024, 1024)
+            content_size = requested_output_size or (1024, 1024)
+            cref_input_size: Optional[Tuple[int, int]] = None
+            sref_input_size: Optional[Tuple[int, int]] = None
 
             if not args.no_images:
                 cref_path = cref_dir / f"{k}.png"
@@ -255,20 +299,17 @@ def worker(rank: int, gpu_id: int, keys: List[str], prompts: Dict[str, str], arg
                 cref = safe_open_rgb(cref_path)
                 sref = safe_open_rgb(sref_path)
 
-                if args.input_resolution:
-                    try:
-                        w_str, h_str = args.input_resolution.lower().split("x", 1)
-                        override_size = (int(w_str), int(h_str))
-                    except Exception:
-                        raise ValueError(f"invalid --input_resolution {args.input_resolution}")
-                    cref = cref.resize(override_size, resample=_lanczos())
-                    content_size = override_size
+                if not args.no_resize_cref:
+                    # resize references with the same bucket logic as the original cref path.
+                    cref, cref_input_size = resize_cref(cref)  # (W,H)
+                    sref, sref_input_size = resize_cref(sref)  # (W,H)
                 else:
-                    # resize cref (按截图逻辑)
-                    if not args.no_resize_cref:
-                        cref, content_size = resize_cref(cref)  # (W,H)
-                    else:
-                        content_size = cref.size  # (W,H)
+                    cref_input_size = cref.size  # (W,H)
+                    sref_input_size = sref.size  # (W,H)
+
+                if requested_output_size is None:
+                    # Backward-compatible default: without an explicit output size, generate at content bucket size.
+                    content_size = cref_input_size
 
                 if args.use_only_cref:
                     image_list = [cref]
@@ -276,7 +317,7 @@ def worker(rank: int, gpu_id: int, keys: List[str], prompts: Dict[str, str], arg
                     # multi-reference：把 cref + sref 一起给 image
                     image_list = [cref, sref]
             else:
-                content_size = (1024, 1024)
+                content_size = requested_output_size or (1024, 1024)
                 image_list = None
 
             # seed
@@ -294,7 +335,8 @@ def worker(rank: int, gpu_id: int, keys: List[str], prompts: Dict[str, str], arg
             ).images[0]
 
             if out.size != content_size:
-                print(f"[WARN][rank{rank}] id={k} out.size={out.size} != target={content_size}")
+                print(f"[WARN][rank{rank}] id={k} out.size={out.size} != target={content_size}, resizing before save")
+                out = out.resize(content_size, resample=_lanczos())
 
             out.save(out_path)
 
@@ -312,7 +354,10 @@ def worker(rank: int, gpu_id: int, keys: List[str], prompts: Dict[str, str], arg
                     "seed": sample_seed,
                     "no_images": bool(args.no_images),
                     "use_only_cref": bool(args.use_only_cref),
+                    "requested_output_size_wh": [content_size[0], content_size[1]],
                     "content_size_wh": [content_size[0], content_size[1]],
+                    "cref_input_size_wh": list(cref_input_size) if cref_input_size is not None else None,
+                    "sref_input_size_wh": list(sref_input_size) if sref_input_size is not None else None,
                     "out_size_wh": [out.size[0], out.size[1]],
                 }
                 meta_f.write(json.dumps(record, ensure_ascii=False) + "\n")

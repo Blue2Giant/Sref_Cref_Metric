@@ -23,6 +23,7 @@ from megfile.smart import (
     smart_makedirs,
     smart_open as mopen,
 )
+import qwen_judge_runtime as runtime
 
 API_KEY = "EMPTY"
 # MODEL = "Qwen3VL30BA3B-Image-Edit"
@@ -33,7 +34,8 @@ BASE_URL = "http://10.201.19.61:22002/v1"
 
 # MODEL="Qwen3-VL-30B-A3B-Instruct"
 # BASE_URL = "http://10.201.17.30:2202/v1"
-TIMEOUT = 720
+DEFAULT_TIMEOUT = 720.0
+TIMEOUT = DEFAULT_TIMEOUT
 RETRY_EXHAUSTED_REASON = "API 重试耗尽"
 
 # Globals for multiprocessing
@@ -41,6 +43,8 @@ G_TRIPLET_DIR = ""
 G_CONTENT_DIRS = []
 G_STYLE_DIRS = []
 G_ARGS = None
+G_RUNTIME_STATS = runtime.WorkerRuntimeStats()
+G_IMAGE_CACHE = runtime.ImageDataUriCache(max_items=0)
 
 RESIZE_MAX_SIDE = 1024
 JPEG_QUALITY = 85
@@ -70,6 +74,7 @@ CONTENT_USER_INSTRUCTION = (
     "   - 关注人物是否为“同一个角色”或“极为相似的角色”，\n"
     "   - 包括性别、年龄段、身材、发型、头发颜色、肤色、服装类型、服装主色调、主要配饰等是否相近，\n"
     "   - 姿势、朝向、镜头视角可以有一定变化，但如果感觉明显是不同的人物或完全不同造型，则视为不一致。\n"
+    "   - 如果参考图中有多人，那么两张图中的所有人物都要一致,并且人物数量也要一致，如果只是都包含“人”但明显不是同一类人物（例如一张是年轻女性，一张是中年男性），则视为不一致。\n"
     "2. 如果是【单一物体】为主体（例如一辆车、一栋房子、一把椅子等）：\n"
     "   - 重点看物体类别和形状结构是否一致（例如都是跑车、都是 SUV、都是圆桌等），\n"
     "   - 允许颜色不同，例如黄色的车和红色的车，只要车型和外形高度相似，就可以视为一致，\n"
@@ -106,6 +111,8 @@ STYLE_SYSTEM_PROMPT = (
     "- 材质与纹理生成方式变化（油画厚涂→平涂赛璐璐→3D塑料感→像素/点描等）\n"
     "- 光影模型变化（硬边影视布光→柔和漫反射插画光→霓虹强对比等）\n"
     "- 调色与色彩策略变化（低饱和复古→高饱和糖果色→黑白素描等）\n"
+
+    "- 注意当其中一张图的画面大量空白或者纯色的时候，而另一张不是的时候，我们直接判别为不一致，因为空白本身也是一种强烈的风格信号（例如极简线稿/水彩边缘/留白构图等），如果两张图的空白感差异很大，说明核心风格机制不同。\n"
     "\n"
     "输出规则：你只能输出一个字符：0 或 1。\n"
     "1 = 画风高度一致（同一风格族，核心机制一致）；0 = 画风不一致。\n"
@@ -138,6 +145,24 @@ STYLE_USER_INSTRUCTION = (
 
 def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def configure_worker_runtime(args_obj: Any = None):
+    global G_ARGS, G_RUNTIME_STATS, G_IMAGE_CACHE, TIMEOUT
+    G_ARGS = args_obj
+    G_RUNTIME_STATS = runtime.WorkerRuntimeStats()
+    cache_size = int(getattr(args_obj, "image_cache_size", 0)) if args_obj is not None else 0
+    G_IMAGE_CACHE = runtime.ImageDataUriCache(max_items=cache_size)
+    timeout_sec = float(getattr(args_obj, "request_timeout_sec", DEFAULT_TIMEOUT)) if args_obj is not None else DEFAULT_TIMEOUT
+    TIMEOUT = max(1.0, timeout_sec)
+
+
+def get_runtime_stats_snapshot() -> Dict[str, float]:
+    return G_RUNTIME_STATS.snapshot()
+
+
+def diff_runtime_stats(before: Dict[str, float], after: Dict[str, float]) -> Dict[str, float]:
+    return runtime.diff_runtime_stats(before, after)
 
 
 def is_image_name(name: str) -> bool:
@@ -190,14 +215,24 @@ def _resize_keep_long_side(img: Image.Image, max_side: int) -> Image.Image:
 
 
 def get_image_data_uri(path: str) -> Optional[str]:
-    img = _load_image(path)
+    cache_key = str(path).strip()
+    cached = G_IMAGE_CACHE.get(cache_key)
+    if cached is not None:
+        G_RUNTIME_STATS.record_cache_hit()
+        return cached
+    G_RUNTIME_STATS.record_cache_miss()
+    img = _load_image(cache_key)
     if img is None:
+        G_RUNTIME_STATS.record_image_encode_failure()
         return None
     img = _resize_keep_long_side(img, RESIZE_MAX_SIDE)
     buf = BytesIO()
     img.save(buf, format="JPEG", quality=JPEG_QUALITY)
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/jpeg;base64,{b64}"
+    data_uri = f"data:image/jpeg;base64,{b64}"
+    G_IMAGE_CACHE.put(cache_key, data_uri)
+    G_RUNTIME_STATS.record_image_encoded()
+    return data_uri
 
 
 def strip_code_fences(s: str) -> str:
@@ -253,6 +288,7 @@ def call_qwen_chat_raw(
     }
 
     for attempt in range(max_retries + 1):
+        started_at = time.time()
         try:
             resp = requests.post(
                 BASE_URL.rstrip("/") + "/chat/completions",
@@ -261,8 +297,10 @@ def call_qwen_chat_raw(
                 timeout=TIMEOUT,
             )
             resp.raise_for_status()
+            G_RUNTIME_STATS.record_api(ok=True, elapsed_sec=time.time() - started_at)
             return resp.json()
         except Exception as e:
+            G_RUNTIME_STATS.record_api(ok=False, elapsed_sec=time.time() - started_at)
             log(f"[Err] API 请求出错(第 {attempt + 1} 次): {e}")
             if attempt < max_retries:
                 time.sleep(retry_delay)
@@ -296,6 +334,7 @@ def call_qwen_chat_with_retry(
         log(f"[Err] API 无响应/请求失败(第 {attempt}/{total_attempts} 次)")
         if attempt < total_attempts:
             time.sleep(retry_delay)
+    G_RUNTIME_STATS.record_retry_exhausted()
     return None
 
 
@@ -460,6 +499,8 @@ def judge_pair_voting(
     judge_times: int,
     min_true: int,
 ) -> Tuple[Optional[bool], Dict[str, Any], bool]:
+    judge_times = max(1, int(judge_times))
+    min_true = max(0, int(min_true))
     trials: List[Dict[str, Any]] = []
     good_true = 0
     retry_exhausted = False
@@ -487,6 +528,35 @@ def judge_pair_voting(
                 "reason": reason,
             }
         )
+        remaining_trials = judge_times - i
+        if good_true >= min_true:
+            detail = {
+                "path_a": path_a,
+                "path_b": path_b,
+                "conf_thr": conf_thr,
+                "judge_times": judge_times,
+                "min_true": min_true,
+                "good_true": good_true,
+                "trials": trials,
+                "status": "ok",
+                "passed": True,
+                "early_stop": "vote_threshold_hit",
+            }
+            return True, detail, False
+        if good_true + remaining_trials < min_true:
+            detail = {
+                "path_a": path_a,
+                "path_b": path_b,
+                "conf_thr": conf_thr,
+                "judge_times": judge_times,
+                "min_true": min_true,
+                "good_true": good_true,
+                "trials": trials,
+                "status": "ok",
+                "passed": False,
+                "early_stop": "vote_threshold_unreachable",
+            }
+            return False, detail, False
 
     if retry_exhausted:
         detail = {

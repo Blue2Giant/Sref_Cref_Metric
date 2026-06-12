@@ -115,6 +115,8 @@ DEFAULT_METRIC_NAMES = (
     "qk_mutual_information",
     "qk_normalized_mutual_information",
 )
+DEFAULT_FLUX_GROUP_NAMES = ("text", "latent", "cref", "sref")
+DEFAULT_Q_GROUP_NAME = "latent"
 DEFAULT_COHORT_DIR = Path("/data/benchmark_metrics/insight/key_folder/flux")
 PALETTE_NAMES = ("tab20", "tab20b", "tab20c")
 
@@ -159,7 +161,8 @@ def parse_args():
     )
     parser.add_argument("--device", default="cpu", help='Compute device such as "cpu" or "cuda:0"')
     parser.add_argument("--dtype", default="float32", help='Compute dtype such as "float32" or "float16"')
-    parser.add_argument("--groups", default="text,cref,sref", help="Comma-separated group names")
+    parser.add_argument("--groups", default="text,latent,cref,sref", help="Comma-separated K-group names")
+    parser.add_argument("--q-group", default=DEFAULT_Q_GROUP_NAME, help="Name of the Q-group used for all metric computation")
     parser.add_argument("--metrics", default="", help="Comma-separated metric names. Default: all")
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--summary-reduction", choices=["mean", "median", "max", "min"], default="mean")
@@ -351,6 +354,100 @@ def collect_fieldnames(rows: Iterable[Dict[str, object]]) -> List[str]:
     return fieldnames
 
 
+def _resolve_q_range_metadata_by_name(payload: Dict[str, object]) -> Dict[str, Dict[str, object]]:
+    by_name = payload.get("q_range_metadata_by_name")
+    if isinstance(by_name, dict) and by_name:
+        return {str(k): dict(v) for k, v in by_name.items()}
+
+    items = payload.get("q_range_metadata")
+    if isinstance(items, list) and items:
+        out: Dict[str, Dict[str, object]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if name:
+                out[name] = dict(item)
+        if out:
+            return out
+
+    ranges = payload.get("q_ranges")
+    sample_indices = [int(x) for x in (payload.get("q_sample_indices") or [])]
+    if isinstance(ranges, list) and ranges:
+        arr = np.asarray(sample_indices, dtype=np.int64)
+        out: Dict[str, Dict[str, object]] = {}
+        for item in ranges:
+            if not isinstance(item, (list, tuple)) or len(item) < 3:
+                continue
+            name, start, end = str(item[0]), int(item[1]), int(item[2])
+            meta: Dict[str, object] = {
+                "name": name,
+                "full_start": start,
+                "full_end_exclusive": end,
+                "full_end_inclusive": end - 1,
+                "full_length": max(end - start, 0),
+                "sample_start": None,
+                "sample_end_exclusive": None,
+                "sample_end_inclusive": None,
+                "sample_length": 0,
+            }
+            if arr.size > 0:
+                loc = np.where((arr >= start) & (arr < end))[0]
+                if loc.size > 0:
+                    sample_start = int(loc.min())
+                    sample_end_exclusive = int(loc.max()) + 1
+                    meta["sample_start"] = sample_start
+                    meta["sample_end_exclusive"] = sample_end_exclusive
+                    meta["sample_end_inclusive"] = sample_end_exclusive - 1
+                    meta["sample_length"] = sample_end_exclusive - sample_start
+            out[name] = meta
+        if out:
+            return out
+
+    raise KeyError("Failed to resolve q_range_metadata_by_name from payload")
+
+
+def _get_q_slice_from_meta(
+    q_range_metadata_by_name: Dict[str, Dict[str, object]],
+    group_name: str,
+    use_sample: bool = True,
+) -> Tuple[int, int]:
+    if group_name not in q_range_metadata_by_name:
+        raise KeyError(f"Q group {group_name!r} not found. Available: {sorted(q_range_metadata_by_name)}")
+    meta = q_range_metadata_by_name[group_name]
+    if use_sample:
+        start = meta.get("sample_start")
+        end = meta.get("sample_end_exclusive")
+        if start is None or end is None:
+            raise ValueError(f"Q group {group_name!r} has no sampled range metadata")
+    else:
+        start = meta.get("full_start")
+        end = meta.get("full_end_exclusive")
+        if start is None or end is None:
+            raise ValueError(f"Q group {group_name!r} has no full range metadata")
+    start = int(start)
+    end = int(end)
+    if end <= start:
+        raise ValueError(f"Invalid Q slice for group {group_name!r}: [{start}, {end})")
+    return start, end
+
+
+def _slice_attn_to_q_group(
+    attn: torch.Tensor,
+    payload: Dict[str, object],
+    q_group_name: str,
+    use_sample: bool = True,
+) -> Tuple[torch.Tensor, Dict[str, Dict[str, object]], Dict[str, object]]:
+    q_range_metadata_by_name = _resolve_q_range_metadata_by_name(payload)
+    q_start, q_end = _get_q_slice_from_meta(q_range_metadata_by_name, q_group_name, use_sample=use_sample)
+    sliced = attn[..., q_start:q_end, :]
+    meta = dict(q_range_metadata_by_name[q_group_name])
+    meta["selected_start"] = q_start
+    meta["selected_end_exclusive"] = q_end
+    meta["selected_length"] = q_end - q_start
+    return sliced, q_range_metadata_by_name, meta
+
+
 def _normalize_block_tensor_map(data: Dict[object, object], source_path: Path) -> Dict[int, torch.Tensor]:
     out: Dict[int, torch.Tensor] = {}
     for key, value in data.items():
@@ -486,6 +583,184 @@ def _resolve_attn_tensor_from_payload_flexible(payload: Dict[str, object], pt_pa
     raise KeyError(f"None of attention tensor keys were found: {ATTN_TENSOR_KEYS}")
 
 
+def _payload_uses_manifest_cache(payload: Dict[str, object]) -> bool:
+    if any(torch.is_tensor(payload.get(key)) for key in ATTN_TENSOR_KEYS):
+        return False
+    return bool(payload.get("storage_format") == "step_block_cache_v1" or payload.get("step_block_files"))
+
+
+def _extract_step_block_maps(payload: Dict[str, object]) -> Dict[int, object]:
+    step_block_files = payload.get("step_block_files")
+    if not isinstance(step_block_files, dict) or not step_block_files:
+        raise RuntimeError("step_block_files missing from manifest payload")
+    return {int(step_key): file_ref for step_key, file_ref in step_block_files.items()}
+
+
+def _infer_manifest_steps_and_blocks(
+    payload: Dict[str, object],
+    step_block_maps: Dict[int, object],
+    base_dir: Path,
+) -> Tuple[List[int], List[int]]:
+    steps = [int(x) for x in (payload.get("steps") or [])]
+    block_ids = [int(x) for x in (payload.get("block_ids") or [])]
+    if steps and block_ids:
+        return steps, block_ids
+    inferred_steps, inferred_blocks = _collect_step_and_block_ids(step_block_maps, base_dir)
+    if not steps:
+        steps = inferred_steps
+    if not block_ids:
+        block_ids = inferred_blocks
+    return steps, block_ids
+
+
+def _infer_manifest_panel_shape(
+    payload: Dict[str, object],
+    step_block_maps: Dict[int, object],
+    base_dir: Path,
+    steps: Sequence[int],
+    block_ids: Sequence[int],
+) -> Tuple[int, int]:
+    q_hint = len(payload.get("q_sample_indices") or [])
+    k_hint = len(payload.get("k_sample_indices") or [])
+    if q_hint > 0 and k_hint > 0:
+        return q_hint, k_hint
+
+    for step in steps:
+        cur_map = _load_step_block_entry(step_block_maps[step], base_dir)
+        for block_id in block_ids:
+            mat = cur_map.get(int(block_id))
+            if mat is None:
+                continue
+            return int(mat.shape[0]), int(mat.shape[1])
+    raise RuntimeError("Failed to infer manifest panel shape from step cache")
+
+
+def _init_metric_grid(
+    steps: Sequence[int],
+    block_ids: Sequence[int],
+    group_names: Sequence[str],
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    shape = (len(steps), len(block_ids))
+    out: Dict[str, Dict[str, torch.Tensor]] = {}
+    for group_name in group_names:
+        out[group_name] = {metric_name: torch.full(shape, float("nan"), dtype=torch.float32) for metric_name in DEFAULT_METRIC_NAMES}
+    return out
+
+
+def _build_streaming_batch(
+    payload: Dict[str, object],
+    k_range_metadata_by_name: Dict[str, Dict[str, object]],
+    tensor_key: str,
+    steps: Sequence[int],
+    block_ids: Sequence[int],
+    q_size: int,
+    k_size: int,
+    attn_mask: torch.Tensor,
+    dtype: Optional[torch.dtype],
+) -> LoadedAttentionBatch:
+    meta_dtype = dtype or torch.float32
+    shape_tensor = torch.empty((len(steps), len(block_ids), q_size, k_size), device="meta", dtype=meta_dtype)
+    return LoadedAttentionBatch(
+        attn=shape_tensor,
+        attn_mask=attn_mask,
+        k_range_metadata_by_name=k_range_metadata_by_name,
+        payload=dict(payload),
+        tensor_key=tensor_key,
+    )
+
+
+def _compute_metrics_for_manifest_stream(
+    *,
+    pt_path: Path,
+    payload: Dict[str, object],
+    device: Optional[str | torch.device],
+    dtype: Optional[str | torch.dtype],
+    group_names: Sequence[str],
+    q_group_name: str,
+    use_sample: bool,
+    topk: int,
+    sanitize: bool,
+) -> Tuple[LoadedAttentionBatch, Dict[str, Dict[str, torch.Tensor]]]:
+    resolved_device = _resolve_device(device)
+    resolved_dtype = _resolve_dtype(dtype)
+    step_block_maps = _extract_step_block_maps(payload)
+    steps, block_ids = _infer_manifest_steps_and_blocks(payload, step_block_maps, pt_path.parent)
+    q_size, k_size = _infer_manifest_panel_shape(payload, step_block_maps, pt_path.parent, steps, block_ids)
+
+    payload = dict(payload)
+    payload.setdefault("steps", [int(x) for x in steps])
+    payload.setdefault("block_ids", [int(x) for x in block_ids])
+    payload.setdefault("q_tokens_full", _infer_token_total(payload.get("q_ranges")))
+    payload.setdefault("k_tokens_full", _infer_token_total(payload.get("k_ranges")))
+
+    k_range_metadata_by_name = resolve_k_range_metadata_by_name(payload)
+    q_range_metadata_by_name = _resolve_q_range_metadata_by_name(payload)
+    q_start, q_end = _get_q_slice_from_meta(q_range_metadata_by_name, q_group_name, use_sample=use_sample)
+    if "text_tokens_est" not in payload:
+        text_meta = k_range_metadata_by_name.get("text")
+        payload["text_tokens_est"] = int(text_meta.get("full_length", 0)) if text_meta else 0
+    payload.setdefault("has_encoder", bool("text" in k_range_metadata_by_name))
+    payload["q_focus_group"] = str(q_group_name)
+
+    attn_mask = torch.zeros((len(steps), len(block_ids)), dtype=torch.bool)
+    metrics = _init_metric_grid(steps, block_ids, group_names)
+
+    for sidx, step in enumerate(steps):
+        cur_map = _load_step_block_entry(step_block_maps[int(step)], pt_path.parent)
+        try:
+            for bidx, block_id in enumerate(block_ids):
+                mat = cur_map.get(int(block_id))
+                if mat is None:
+                    continue
+
+                panel = mat.to(device=resolved_device, dtype=resolved_dtype or mat.dtype)
+                panel = panel[q_start:q_end, :]
+                if sanitize:
+                    panel = _sanitize_attention(panel, None)
+
+                panel_metrics = compute_metrics_for_named_groups(
+                    attn=panel,
+                    k_range_metadata_by_name=k_range_metadata_by_name,
+                    group_names=group_names,
+                    use_sample=use_sample,
+                    topk=topk,
+                    valid_mask=None,
+                )
+                attn_mask[sidx, bidx] = True
+
+                for group_name, group_metrics in panel_metrics.items():
+                    for metric_name, value in group_metrics.items():
+                        if value.numel() != 1:
+                            raise ValueError(
+                                f"Expected scalar metric for manifest panel, got shape={tuple(value.shape)} "
+                                f"group={group_name} metric={metric_name} pt={pt_path}"
+                            )
+                        metrics[group_name][metric_name][sidx, bidx] = float(value.detach().float().cpu().item())
+
+                del panel_metrics
+                del panel
+        finally:
+            del cur_map
+            if resolved_device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    if not bool(attn_mask.any().item()):
+        raise RuntimeError(f"No valid panels found in manifest payload: {pt_path}")
+
+    batch = _build_streaming_batch(
+        payload=payload,
+        k_range_metadata_by_name=k_range_metadata_by_name,
+        tensor_key="step_block_cache_v1_stream",
+        steps=steps,
+        block_ids=block_ids,
+        q_size=q_end - q_start,
+        k_size=k_size,
+        attn_mask=attn_mask,
+        dtype=resolved_dtype,
+    )
+    return batch, metrics
+
+
 def load_attention_batch_flux_compatible(
     pt_path: str | Path,
     device: Optional[str | torch.device] = "auto",
@@ -525,15 +800,50 @@ def compute_metrics_for_named_groups_from_pt_flux(
     device: Optional[str | torch.device] = "auto",
     dtype: Optional[str | torch.dtype] = torch.float32,
     group_names: Sequence[str] = DEFAULT_GROUP_NAMES,
+    q_group_name: str = DEFAULT_Q_GROUP_NAME,
     use_sample: bool = True,
     topk: int = 5,
     sanitize: bool = True,
 ) -> Tuple[LoadedAttentionBatch, Dict[str, Dict[str, torch.Tensor]]]:
+    pt_path = Path(pt_path)
+    payload = torch.load(pt_path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"Expected dict payload in {pt_path}, got {type(payload).__name__}")
+
+    if _payload_uses_manifest_cache(payload):
+        return _compute_metrics_for_manifest_stream(
+            pt_path=pt_path,
+            payload=payload,
+            device=device,
+            dtype=dtype,
+            group_names=group_names,
+            q_group_name=q_group_name,
+            use_sample=use_sample,
+            topk=topk,
+            sanitize=sanitize,
+        )
+
     batch = load_attention_batch_flux_compatible(
         pt_path=pt_path,
         device=device,
         dtype=dtype,
         sanitize=sanitize,
+    )
+    sliced_attn, _q_range_metadata_by_name, q_meta = _slice_attn_to_q_group(
+        batch.attn,
+        dict(batch.payload),
+        q_group_name=q_group_name,
+        use_sample=use_sample,
+    )
+    payload = dict(batch.payload)
+    payload["q_focus_group"] = str(q_group_name)
+    payload["q_focus_meta"] = q_meta
+    batch = LoadedAttentionBatch(
+        attn=sliced_attn,
+        attn_mask=batch.attn_mask,
+        k_range_metadata_by_name=batch.k_range_metadata_by_name,
+        payload=payload,
+        tensor_key=batch.tensor_key,
     )
     metrics = compute_metrics_for_named_groups(
         attn=batch.attn,
@@ -549,6 +859,7 @@ def compute_metrics_for_named_groups_from_pt_flux(
 def build_row_flux(
     pt_path: Path,
     group_names: Sequence[str],
+    q_group_name: str,
     reduction: str,
     device: str,
     dtype: str,
@@ -559,6 +870,7 @@ def build_row_flux(
         device=device,
         dtype=dtype,
         group_names=group_names,
+        q_group_name=q_group_name,
         use_sample=True,
         topk=topk,
     )
@@ -576,6 +888,7 @@ def build_row_flux(
         "dir_name": parent_name,
         "pt_path": str(pt_path),
         "tensor_key": batch.tensor_key,
+        "q_group_name": str(q_group_name),
         "num_steps": int(batch.attn.shape[0]) if batch.attn.ndim >= 4 else -1,
         "num_blocks": int(batch.attn.shape[1]) if batch.attn.ndim >= 4 else -1,
         "num_q": int(batch.attn.shape[-2]),
@@ -592,6 +905,16 @@ def build_row_flux(
         "valid_panels": int(batch.attn_mask.sum().item()) if batch.attn_mask is not None else -1,
         "total_panels": int(batch.attn_mask.numel()) if batch.attn_mask is not None else -1,
     }
+    try:
+        q_meta = _resolve_q_range_metadata_by_name(payload).get(str(q_group_name), {})
+    except Exception:
+        q_meta = {}
+    if q_meta:
+        row["q_group_full_start"] = _safe_int(q_meta.get("full_start"))
+        row["q_group_full_end_exclusive"] = _safe_int(q_meta.get("full_end_exclusive"))
+        row["q_group_sample_start"] = _safe_int(q_meta.get("sample_start"))
+        row["q_group_sample_end_exclusive"] = _safe_int(q_meta.get("sample_end_exclusive"))
+        row["q_group_sample_length"] = _safe_int(q_meta.get("sample_length"), default=0)
 
     for group_name in group_names:
         if group_name not in batch.k_range_metadata_by_name:
@@ -612,6 +935,7 @@ def export_summary_csv_flux(
     root_dir: Path,
     out_csv: Path,
     group_names: Sequence[str],
+    q_group_name: str,
     reduction: str,
     device: str,
     dtype: str,
@@ -636,6 +960,7 @@ def export_summary_csv_flux(
                 build_row_flux(
                     pt_path=pt_path,
                     group_names=group_names,
+                    q_group_name=q_group_name,
                     reduction=reduction,
                     device=device,
                     dtype=dtype,
@@ -671,6 +996,7 @@ def collect_samples_flux(
     cohort_specs: Sequence[CohortSpec],
     group_names: Sequence[str],
     metric_names: Sequence[str],
+    q_group_name: str,
     device: str,
     dtype: str,
     topk: int,
@@ -705,6 +1031,7 @@ def collect_samples_flux(
                     device=device,
                     dtype=dtype,
                     group_names=group_names,
+                    q_group_name=q_group_name,
                     use_sample=True,
                     topk=topk,
                 )
@@ -1044,8 +1371,9 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    group_names = tuple(x.strip() for x in str(args.groups).split(",") if x.strip()) or DEFAULT_GROUP_NAMES
+    group_names = tuple(x.strip() for x in str(args.groups).split(",") if x.strip()) or DEFAULT_FLUX_GROUP_NAMES
     metric_names = tuple(x.strip() for x in str(args.metrics).split(",") if x.strip()) or DEFAULT_METRIC_NAMES
+    q_group_name = str(args.q_group).strip() or DEFAULT_Q_GROUP_NAME
 
     summary_csv = Path(args.summary_csv) if args.summary_csv else output_dir / "attention_metrics_summary_all.csv"
     selected_long_csv = Path(args.selected_long_csv) if args.selected_long_csv else output_dir / "selected_metrics_long.csv"
@@ -1080,6 +1408,7 @@ def main():
             root_dir=root_dir,
             out_csv=summary_csv,
             group_names=group_names,
+            q_group_name=q_group_name,
             reduction=str(args.summary_reduction),
             device=str(args.device),
             dtype=str(args.dtype),
@@ -1102,6 +1431,7 @@ def main():
             cohort_specs=cohort_specs,
             group_names=group_names,
             metric_names=metric_names,
+            q_group_name=q_group_name,
             device=str(args.device),
             dtype=str(args.dtype),
             topk=int(args.topk),
@@ -1141,6 +1471,7 @@ def main():
         "cohort_agg_csv": str(cohort_agg_csv),
         "cohort_dir": str(args.cohort_dir),
         "group_names": list(group_names),
+        "q_group_name": q_group_name,
         "metric_names": list(metric_names),
         "num_selected_samples": len(samples),
         "num_cohorts": len(cohort_specs),

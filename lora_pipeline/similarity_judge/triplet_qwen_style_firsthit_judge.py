@@ -13,13 +13,26 @@ from typing import Any, Dict, List, Sequence, Tuple
 from tqdm import tqdm
 
 import triplet_qwen_style_index_judge as base
+import qwen_judge_runtime as runtime
 
 
 G_ARGS = None
+PAIR_KEY_ORDER_CHOICES = ("content_style", "style_content")
 
 
 def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def parse_pair_key_ids(pair_key: str, pair_key_order: str) -> Tuple[str, str]:
+    left_id, right_id = pair_key.split("__", 1)
+    left_id = left_id.strip()
+    right_id = right_id.strip()
+    if pair_key_order == "content_style":
+        return left_id, right_id
+    if pair_key_order == "style_content":
+        return right_id, left_id
+    raise ValueError(f"未知的 pair_key_order: {pair_key_order}")
 
 
 def _probe_single_url(url: str, timeout_sec: float) -> Tuple[bool, str]:
@@ -86,7 +99,12 @@ def _dedupe_preserve_order(paths: Sequence[str]) -> List[str]:
     return out
 
 
-def parse_triplet_jsonl(path: str, style_index: Dict[str, List[str]], per_image: bool = False) -> Tuple[List[Dict[str, Any]], int]:
+def parse_triplet_jsonl(
+    path: str,
+    style_index: Dict[str, List[str]],
+    pair_key_order: str = "content_style",
+    per_image: bool = False,
+) -> Tuple[List[Dict[str, Any]], int]:
     tasks: List[Dict[str, Any]] = []
     skipped = 0
     if not os.path.isfile(path):
@@ -111,7 +129,7 @@ def parse_triplet_jsonl(path: str, style_index: Dict[str, List[str]], per_image:
                 if not isinstance(arr, list) or not arr:
                     skipped += 1
                     continue
-                _cid, style_id = pair_key.split("__", 1)
+                _cid, style_id = parse_pair_key_ids(pair_key, pair_key_order=pair_key_order)
                 style_id = style_id.strip()
                 style_imgs = style_index.get(style_id, [])
                 if per_image:
@@ -180,6 +198,77 @@ def sample_paths_for_all_similar(paths: Sequence[str], sample_size: int, seed: i
     return rng.sample(uniq_paths, sample_size)
 
 
+def _new_endpoint_agg() -> Dict[str, float]:
+    out: Dict[str, float] = {
+        "tasks": 0,
+        "task_wall_sec": 0.0,
+        "matched": 0,
+        "all_similar": 0,
+        "no_match": 0,
+        "errors": 0,
+    }
+    for key in runtime.RUNTIME_STAT_KEYS:
+        out[key] = 0.0
+    return out
+
+
+def _clone_endpoint_aggs(endpoint_aggs: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+    return {k: dict(v) for k, v in endpoint_aggs.items()}
+
+
+def _update_endpoint_agg(endpoint_aggs: Dict[str, Dict[str, float]], rec: Dict[str, Any]):
+    endpoint = str(rec.get("endpoint", "") or "unknown")
+    agg = endpoint_aggs.setdefault(endpoint, _new_endpoint_agg())
+    agg["tasks"] += 1
+    agg["task_wall_sec"] += float(rec.get("task_wall_sec", 0.0) or 0.0)
+    bucket = str(rec.get("bucket", "") or "")
+    if bucket == "matched":
+        agg["matched"] += 1
+    elif bucket == "all_similar":
+        agg["all_similar"] += 1
+    elif bucket == "no_match":
+        agg["no_match"] += 1
+    if rec.get("error"):
+        agg["errors"] += 1
+    runtime_stats = rec.get("runtime", {})
+    if isinstance(runtime_stats, dict):
+        for key in runtime.RUNTIME_STAT_KEYS:
+            agg[key] += float(runtime_stats.get(key, 0.0) or 0.0)
+
+
+def _log_endpoint_stats(
+    endpoint_aggs: Dict[str, Dict[str, float]],
+    total_elapsed_sec: float,
+    window_elapsed_sec: float,
+    prev_snapshot: Dict[str, Dict[str, float]],
+):
+    if not endpoint_aggs:
+        return
+    log(
+        f"[EndpointStats] total_elapsed={max(0.0, total_elapsed_sec):.1f}s "
+        f"window={max(0.0, window_elapsed_sec):.1f}s"
+    )
+    for endpoint in sorted(endpoint_aggs):
+        cur = endpoint_aggs[endpoint]
+        prev = prev_snapshot.get(endpoint, {})
+        window_tasks = cur["tasks"] - float(prev.get("tasks", 0.0) or 0.0)
+        window_calls = cur["api_calls"] - float(prev.get("api_calls", 0.0) or 0.0)
+        avg_api_ms = (cur["api_elapsed_sec"] * 1000.0 / cur["api_calls"]) if cur["api_calls"] > 0 else 0.0
+        cache_total = cur["cache_hits"] + cur["cache_misses"]
+        cache_hit_rate = (cur["cache_hits"] / cache_total) if cache_total > 0 else 0.0
+        window_qps = (window_calls / window_elapsed_sec) if window_elapsed_sec > 0 else 0.0
+        log(
+            f"[EndpointStats] endpoint={endpoint} "
+            f"tasks={int(cur['tasks'])}(+{int(window_tasks)}) "
+            f"api={int(cur['api_calls'])}(+{int(window_calls)}, {window_qps:.2f}/s) "
+            f"ok={int(cur['api_success'])} fail={int(cur['api_fail'])} "
+            f"retry_exhausted={int(cur['api_retry_exhausted'])} "
+            f"avg_api_ms={avg_api_ms:.0f} cache_hit={cache_hit_rate:.1%} "
+            f"matched={int(cur['matched'])} all_similar={int(cur['all_similar'])} "
+            f"no_match={int(cur['no_match'])} err={int(cur['errors'])}"
+        )
+
+
 def _judge_one(task: Dict[str, Any]) -> Dict[str, Any]:
     """返回每个任务的判别输出。per-image 模式下按 bucket 分流到不同 jsonl。"""
     args = G_ARGS
@@ -187,6 +276,10 @@ def _judge_one(task: Dict[str, Any]) -> Dict[str, Any]:
     result_key = task.get("result_key", pair_key)
     main_img = task["main_img"]
     style_imgs = task["style_imgs"]
+    match_threshold = int(args.match_threshold)
+    exact_all_similar = bool(getattr(args, "exact_all_similar", False)) and bool(getattr(args, "per_image", False))
+    refs_examined = 0
+    early_stop = ""
 
     if not base.smart_exists(main_img):
         return {
@@ -195,6 +288,9 @@ def _judge_one(task: Dict[str, Any]) -> Dict[str, Any]:
             "value": [],
             "bucket": "error",
             "error": f"main_not_found: {main_img}",
+            "refs_total": 0,
+            "refs_examined": refs_examined,
+            "early_stop": early_stop,
         }
     if not style_imgs:
         return {
@@ -203,6 +299,9 @@ def _judge_one(task: Dict[str, Any]) -> Dict[str, Any]:
             "value": [],
             "bucket": "error",
             "error": f"style_id_not_found: {task['style_id']}",
+            "refs_total": 0,
+            "refs_examined": refs_examined,
+            "early_stop": early_stop,
         }
 
     existing_style_imgs = _dedupe_preserve_order([sp for sp in style_imgs if base.smart_exists(sp)])
@@ -213,10 +312,14 @@ def _judge_one(task: Dict[str, Any]) -> Dict[str, Any]:
             "value": [],
             "bucket": "error",
             "error": f"style_refs_not_found: {task['style_id']}",
+            "refs_total": 0,
+            "refs_examined": refs_examined,
+            "early_stop": early_stop,
         }
 
     matched_paths: List[str] = []
-    for sp in existing_style_imgs:
+    refs_total = len(existing_style_imgs)
+    for idx, sp in enumerate(existing_style_imgs, 1):
         decision, _detail, retry_exhausted = base.judge_pair_voting(
             path_a=main_img,
             path_b=sp,
@@ -226,6 +329,7 @@ def _judge_one(task: Dict[str, Any]) -> Dict[str, Any]:
             judge_times=int(args.style_judge_times),
             min_true=int(args.style_min_true),
         )
+        refs_examined = idx
         if retry_exhausted:
             return {
                 "pair_key": pair_key,
@@ -233,20 +337,33 @@ def _judge_one(task: Dict[str, Any]) -> Dict[str, Any]:
                 "value": [],
                 "bucket": "error",
                 "error": "retry_exhausted",
+                "refs_total": refs_total,
+                "refs_examined": refs_examined,
+                "early_stop": early_stop,
             }
         if decision is True:
             matched_paths.append(sp)
+            if match_threshold > 0 and len(matched_paths) >= match_threshold and not exact_all_similar:
+                early_stop = "match_threshold_hit"
+                break
+        remaining_refs = refs_total - refs_examined
+        if match_threshold > 0 and len(matched_paths) + remaining_refs < match_threshold:
+            early_stop = "match_threshold_unreachable"
+            break
 
     if bool(getattr(args, "per_image", False)):
-        if (not matched_paths) or (len(matched_paths) < int(args.match_threshold)):
+        if (not matched_paths) or (len(matched_paths) < match_threshold):
             return {
                 "pair_key": pair_key,
                 "result_key": result_key,
                 "value": [],
                 "bucket": "no_match",
                 "error": "",
+                "refs_total": refs_total,
+                "refs_examined": refs_examined,
+                "early_stop": early_stop,
             }
-        if len(matched_paths) == len(existing_style_imgs):
+        if exact_all_similar and refs_examined >= refs_total and len(matched_paths) == refs_total:
             sampled_paths = sample_paths_for_all_similar(
                 matched_paths,
                 sample_size=int(args.all_similar_sample_size),
@@ -259,6 +376,9 @@ def _judge_one(task: Dict[str, Any]) -> Dict[str, Any]:
                 "value": sampled_paths,
                 "bucket": "all_similar",
                 "error": "",
+                "refs_total": refs_total,
+                "refs_examined": refs_examined,
+                "early_stop": early_stop,
             }
         return {
             "pair_key": pair_key,
@@ -266,41 +386,56 @@ def _judge_one(task: Dict[str, Any]) -> Dict[str, Any]:
             "value": list(matched_paths),
             "bucket": "matched",
             "error": "",
+            "refs_total": refs_total,
+            "refs_examined": refs_examined,
+            "early_stop": early_stop,
         }
 
     # 兼容旧行为：按 pair 输出，命中阈值才写入固定数量的 style 路径，否则写空列表。
-    out_value = decide_matched_paths_output(matched_paths, int(args.match_threshold))
+    out_value = decide_matched_paths_output(matched_paths, match_threshold)
     return {
         "pair_key": pair_key,
         "result_key": result_key,
         "value": out_value,
         "bucket": "matched" if out_value else "no_match",
         "error": "",
+        "refs_total": refs_total,
+        "refs_examined": refs_examined,
+        "early_stop": early_stop,
     }
 
 
 def _worker_queue(model: str, base_url: str, task_queue: mp.Queue, result_queue: mp.Queue, args_obj: Any):
     base.MODEL = model
     base.BASE_URL = base_url
-    base.G_ARGS = args_obj
+    base.configure_worker_runtime(args_obj)
     global G_ARGS
     G_ARGS = args_obj
+    endpoint = f"{model}@{base_url}"
     while True:
         task = task_queue.get()
         if task is None:
             break
+        stats_before = base.get_runtime_stats_snapshot()
+        task_started_at = time.time()
         try:
-            result_queue.put(_judge_one(task))
+            rec = _judge_one(task)
         except Exception as e:
-            result_queue.put(
-                {
-                    "pair_key": task.get("pair_key", ""),
-                    "result_key": task.get("result_key", task.get("pair_key", "")),
-                    "value": [],
-                    "bucket": "error",
-                    "error": f"worker_exception: {e}",
-                }
-            )
+            rec = {
+                "pair_key": task.get("pair_key", ""),
+                "result_key": task.get("result_key", task.get("pair_key", "")),
+                "value": [],
+                "bucket": "error",
+                "error": f"worker_exception: {e}",
+                "refs_total": 0,
+                "refs_examined": 0,
+                "early_stop": "",
+            }
+        stats_after = base.get_runtime_stats_snapshot()
+        rec["endpoint"] = endpoint
+        rec["task_wall_sec"] = max(0.0, time.time() - task_started_at)
+        rec["runtime"] = base.diff_runtime_stats(stats_before, stats_after)
+        result_queue.put(rec)
 
 
 def main():
@@ -317,31 +452,70 @@ def main():
     parser.add_argument("--style_judge_times", type=int, default=3)
     parser.add_argument("--style_min_true", type=int, default=3)
     parser.add_argument("--match_threshold", type=int, default=1, help="至少命中多少张style图才视为通过，默认1")
+    parser.add_argument(
+        "--pair-key-order",
+        type=str,
+        default="content_style",
+        choices=PAIR_KEY_ORDER_CHOICES,
+        help="pair_key 中两个 id 的顺序：content_style 表示 content_id__style_id；style_content 表示 style_id__content_id。",
+    )
     parser.add_argument("--per-image", action="store_true", help="把输入 jsonl 的 value 列表里的每张图都展开为独立任务，并以图片路径为输出 key。")
     parser.add_argument("--all-similar-sample-size", type=int, default=2, help="per-image 模式下，全相似结果输出时随机采样多少张风格参考图。")
+    parser.add_argument(
+        "--exact-all-similar",
+        action="store_true",
+        help="达到 match_threshold 后继续扫描全部参考图，以便精确区分 all_similar；默认关闭，执行真正 first-hit/threshold early-stop。",
+    )
     parser.add_argument("--model", type=str, default=base.MODEL)
     parser.add_argument("--base_url", type=str, default=base.BASE_URL)
     parser.add_argument("--endpoint", action="append", default=[])
     parser.add_argument("--procs_per_endpoint", type=int, default=1)
     parser.add_argument("--conn_retry_times", type=int, default=5)
     parser.add_argument("--conn_retry_delay", type=float, default=2.0)
+    parser.add_argument("--request-timeout-sec", type=float, default=180.0)
+    parser.add_argument("--image-cache-size", type=int, default=32)
+    parser.add_argument("--stats-interval-sec", type=float, default=60.0)
     parser.add_argument("--probe-timeout", type=float, default=3.0)
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--flush-every", type=int, default=1)
+    parser.add_argument("--flush-every", type=int, default=32)
     args = parser.parse_args()
     if int(args.match_threshold) < 0:
         raise RuntimeError("--match_threshold 必须 >= 0")
     if int(args.all_similar_sample_size) <= 0:
         raise RuntimeError("--all_similar_sample_size 必须 > 0")
+    if float(args.request_timeout_sec) <= 0:
+        raise RuntimeError("--request-timeout-sec 必须 > 0")
+    if int(args.image_cache_size) < 0:
+        raise RuntimeError("--image-cache-size 必须 >= 0")
+    if float(args.stats_interval_sec) <= 0:
+        raise RuntimeError("--stats-interval-sec 必须 > 0")
 
     style_index = read_style_index(args.style_index_jsonl)
-    tasks, skipped_parse = parse_triplet_jsonl(args.triplet_jsonl, style_index, per_image=bool(args.per_image))
+    tasks, skipped_parse = parse_triplet_jsonl(
+        args.triplet_jsonl,
+        style_index,
+        pair_key_order=str(args.pair_key_order),
+        per_image=bool(args.per_image),
+    )
     if not tasks:
         raise RuntimeError("没有可处理任务")
+    log(f"[Host] pair_key_order={args.pair_key_order}")
+    if args.exact_all_similar:
+        log("[Host] exact_all_similar=on，将在达到阈值后继续扫描全部参考图")
+    else:
+        log("[Host] exact_all_similar=off，执行真正 first-hit/threshold early-stop")
+    log(
+        f"[Host] request_timeout_sec={float(args.request_timeout_sec):.1f} "
+        f"image_cache_size={int(args.image_cache_size)} "
+        f"stats_interval_sec={float(args.stats_interval_sec):.1f}"
+    )
 
     resume_paths: List[str] = []
     processed_path = args.processed_jsonl.strip()
-    all_similar_path = args.all_similar_out_jsonl.strip()
+    requested_all_similar_path = args.all_similar_out_jsonl.strip()
+    all_similar_path = requested_all_similar_path if bool(args.exact_all_similar) else ""
+    if requested_all_similar_path and not all_similar_path:
+        log("[Host] all_similar_out_jsonl 已忽略；当前为真正 first-hit 模式，不再为区分 all_similar 扫完整个参考集")
     if processed_path:
         resume_paths.append(processed_path)
     else:
@@ -420,6 +594,22 @@ def main():
     flush_every = max(1, int(args.flush_every))
     out_mode = "w" if args.overwrite else "a"
     unit_name = "image" if bool(args.per_image) else "pair"
+    endpoint_aggs: Dict[str, Dict[str, float]] = {}
+    run_started_at = time.time()
+    last_stats_log_at = run_started_at
+    last_stats_snapshot: Dict[str, Dict[str, float]] = {}
+
+    def maybe_log_endpoint_stats(force: bool = False):
+        nonlocal last_stats_log_at, last_stats_snapshot
+        now = time.time()
+        if (not force) and (now - last_stats_log_at < float(args.stats_interval_sec)):
+            return
+        total_elapsed = max(0.001, now - run_started_at)
+        window_elapsed = max(0.001, now - last_stats_log_at)
+        _log_endpoint_stats(endpoint_aggs, total_elapsed, window_elapsed, last_stats_snapshot)
+        last_stats_snapshot = _clone_endpoint_aggs(endpoint_aggs)
+        last_stats_log_at = now
+
     pbar = tqdm(total=total, desc="StyleFirstHit", unit=unit_name)
     with open(out_path, out_mode, encoding="utf-8", buffering=1) as fout:
         fall = open(all_similar_path, out_mode, encoding="utf-8", buffering=1) if all_similar_path else None
@@ -431,9 +621,11 @@ def main():
                     rec = result_queue.get(timeout=10.0)
                     done += 1
                 except queue.Empty:
+                    maybe_log_endpoint_stats(force=False)
                     if any(p.is_alive() for p in workers):
                         continue
                     break
+                _update_endpoint_agg(endpoint_aggs, rec)
                 result_key = rec.get("result_key", "")
                 value = rec.get("value", [])
                 bucket = rec.get("bucket", "matched")
@@ -485,6 +677,7 @@ def main():
                     else:
                         ratio = (matched / written) if written > 0 else 0.0
                         log(f"progress {done}/{total} written={written} matched={matched} matched_ratio={ratio:.2%} err={errs}")
+                    maybe_log_endpoint_stats(force=True)
         finally:
             if fall is not None:
                 fall.close()
@@ -501,6 +694,7 @@ def main():
         missing = total - done
         errs += missing
         log(f"[WARN] worker提前退出，未返回结果数量={missing}")
+    maybe_log_endpoint_stats(force=True)
     if bool(args.per_image):
         ratio = (written / done) if done > 0 else 0.0
         log(

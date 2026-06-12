@@ -4,7 +4,7 @@ set -uo pipefail
 trap '' HUP
 
 DEFAULT_GROUP="buffer"
-DEFAULT_CPU="40"
+DEFAULT_CPU="80"
 DEFAULT_GPU="4"
 DEFAULT_MEMORY="800000"
 DEFAULT_RETRY_SLEEP="3"
@@ -109,7 +109,7 @@ trap stop_current_job INT TERM
 
 launch_once() {
     local cmd=(
-        brainctl launch
+        rlaunch
         "--charged-group=${GROUP}"
         --private-machine=yes
         "--cpu=${CPU}"

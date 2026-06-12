@@ -206,6 +206,74 @@ def resolve_k_range_metadata_by_name(payload: Mapping[str, object]) -> Dict[str,
     raise KeyError("Failed to resolve k_range_metadata_by_name from payload")
 
 
+def _parse_q_focus_fields(meta: Mapping[str, object]) -> Optional[Dict[str, object]]:
+    name = str(meta.get("q_focus_name", "") or "").strip()
+    start = meta.get("q_focus_start")
+    end = meta.get("q_focus_end_exclusive")
+    if not name and start is None and end is None:
+        return None
+    q_focus_start = int(start) if start is not None else 0
+    q_focus_end_exclusive = int(end) if end is not None else q_focus_start
+    q_focus_length = max(q_focus_end_exclusive - q_focus_start, 0)
+    return {
+        "q_focus_name": name or "unknown",
+        "q_focus_start": q_focus_start,
+        "q_focus_end_exclusive": q_focus_end_exclusive,
+        "q_focus_end_inclusive": q_focus_end_exclusive - 1 if q_focus_length > 0 else -1,
+        "q_focus_length": q_focus_length,
+    }
+
+
+def resolve_query_focus_metadata(payload: Mapping[str, object]) -> Dict[str, object]:
+    q_tokens_full = int(payload.get("q_tokens_full", 0) or 0)
+    q_sample_indices = [int(x) for x in (payload.get("q_sample_indices") or [])]
+
+    parsed = _parse_q_focus_fields(payload)
+    if parsed is None:
+        collector_meta = payload.get("collector_meta")
+        if isinstance(collector_meta, dict) and collector_meta:
+            def _sort_key(item):
+                key = item[0]
+                try:
+                    return (0, int(key))
+                except Exception:
+                    return (1, str(key))
+
+            for _, value in sorted(collector_meta.items(), key=_sort_key):
+                if isinstance(value, Mapping):
+                    parsed = _parse_q_focus_fields(value)
+                    if parsed is not None:
+                        break
+
+    if parsed is None:
+        if q_sample_indices:
+            q_focus_start = min(q_sample_indices)
+            q_focus_end_exclusive = max(q_sample_indices) + 1
+            if q_tokens_full > 0 and len(q_sample_indices) == q_tokens_full and q_focus_start == 0 and q_focus_end_exclusive == q_tokens_full:
+                q_focus_name = "full"
+            else:
+                q_focus_name = "sampled"
+            q_focus_length = max(q_focus_end_exclusive - q_focus_start, 0)
+        else:
+            q_focus_name = "unknown"
+            q_focus_start = 0
+            q_focus_end_exclusive = q_tokens_full
+            q_focus_length = max(q_focus_end_exclusive - q_focus_start, 0)
+        parsed = {
+            "q_focus_name": q_focus_name,
+            "q_focus_start": q_focus_start,
+            "q_focus_end_exclusive": q_focus_end_exclusive,
+            "q_focus_end_inclusive": q_focus_end_exclusive - 1 if q_focus_length > 0 else -1,
+            "q_focus_length": q_focus_length,
+        }
+
+    parsed["q_tokens_full"] = q_tokens_full
+    parsed["q_sample_len"] = len(q_sample_indices)
+    parsed["q_sample_start"] = min(q_sample_indices) if q_sample_indices else -1
+    parsed["q_sample_end_exclusive"] = (max(q_sample_indices) + 1) if q_sample_indices else -1
+    return parsed
+
+
 def load_attention_batch(
     pt_path: str | Path,
     device: Optional[str | torch.device] = "auto",

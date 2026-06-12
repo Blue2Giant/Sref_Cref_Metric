@@ -29,6 +29,7 @@ try:
         DEFAULT_GROUP_NAMES,
         compute_metrics_for_named_groups_from_pt,
         get_k_slice_from_meta,
+        resolve_query_focus_metadata,
         summarize_group_metrics,
     )
 except ModuleNotFoundError:
@@ -36,6 +37,7 @@ except ModuleNotFoundError:
         DEFAULT_GROUP_NAMES,
         compute_metrics_for_named_groups_from_pt,
         get_k_slice_from_meta,
+        resolve_query_focus_metadata,
         summarize_group_metrics,
     )
 
@@ -121,6 +123,7 @@ def build_row(
     )
     summary = summarize_group_metrics(metrics, reduction=reduction)
     payload = batch.payload
+    q_focus = resolve_query_focus_metadata(payload)
     parent_name = pt_path.parent.name
 
     row: Dict[str, object] = {
@@ -136,6 +139,12 @@ def build_row(
         "k_tokens_full": _safe_int(payload.get("k_tokens_full")),
         "q_sample_len": len(payload.get("q_sample_indices") or []),
         "k_sample_len": len(payload.get("k_sample_indices") or []),
+        "q_focus_name": str(q_focus.get("q_focus_name", "")),
+        "q_focus_start": _safe_int(q_focus.get("q_focus_start")),
+        "q_focus_end_exclusive": _safe_int(q_focus.get("q_focus_end_exclusive")),
+        "q_focus_end_inclusive": _safe_int(q_focus.get("q_focus_end_inclusive")),
+        "q_focus_length": _safe_int(q_focus.get("q_focus_length"), default=0),
+        "q_focus_range": f"[{_safe_int(q_focus.get('q_focus_start'))},{_safe_int(q_focus.get('q_focus_end_exclusive'))})",
         "step_stride": _safe_int(payload.get("step_stride")),
         "block_stride": _safe_int(payload.get("block_stride")),
         "aggregate_head": str(payload.get("aggregate_head", "")),

@@ -5,12 +5,12 @@ RUNNER_PY="/data/benchmark_metrics/benchmark_metrics/encoder_batch_runner.py"
 GPUS="0"
 #sref
 MODELS=("ours" "newnew800_omnistyle" "newnew800_csgo" "newnew800_easyref" "newnew800_flux_9b" "newnew800_omnistyle" "uso" "gpt4o-edit" "gemini-edit")
-MODELS=("gpt4o-edit" "gemini-edit") #还没跑的
+MODELS=("gemini-edit" "seedream" "TeleStyle") #还没跑的
 SREF_ROOT="/mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content"
 
 #cref sref
 MODELS=("ours" "uso" "gpt4o-edit" "gemini-edit" "qwen-edit")
-MODELS=("flux_9b_klein") #还没跑的
+MODELS=("flux_9b_klein" "TeleStyle") #还没跑的
 SREF_ROOT="/mnt/jfs/bench-bucket/sref_bench/sample_800_cref_sref_200_content"
 
 

@@ -1,4 +1,7 @@
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 import numpy as np
 import os
 import math
@@ -117,6 +120,8 @@ def denoise_save_hotmap(
                     mean_map = mean_map[txt_token_len:txt_token_len+img_token_len, txt_token_len:txt_token_len+img_token_len]  # (img_len, txt_len)
                     mean_map = (mean_map - mean_map.min()) / (mean_map.max() - mean_map.min() + 1e-6)
                     mean_map = (mean_map.float() * 255).cpu().numpy()
+                    if plt is None:
+                        raise RuntimeError('matplotlib is required when save_attn_path is enabled')
                     colored_map = plt.get_cmap('hot')(mean_map)[:, :, :3]
                     img_mean = Image.fromarray((colored_map * 255).astype(np.uint8))
                     img_mean = img_mean.convert("RGB")

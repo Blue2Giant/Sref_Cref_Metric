@@ -5,7 +5,7 @@ upload benchmark data
 三行搞定
 brew install huggingface-cli
 hf auth login
-hf upload Blue2Giant/FreeStyle_Bench /local/path subdir/in/repo --repo-type=dataset
+hf upload Blue2Giant/FreeStyle_Dataset /mnt/jfs/vgo_hf_exports/0426_lora_triplet_normalized cref_sref --repo-type=dataset
 """
 # from huggingface_hub import HfApi
 # api = HfApi()

@@ -17,14 +17,14 @@ fi
 
 echo "[INFO] Using GPU ids: $gpu_ids"
 
-python /data/benchmark_metrics/insight/qwen_2511_attention_fullmap_kfull.py \
+python /data/benchmark_metrics/insight/qwen_2511_attention_fullmap_kfull_ours.py \
   --prompts_json /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/prompts.json \
   --cref_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/cref \
   --sref_dir /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/sref \
-  --out_dir /mnt/jfs/qwen-edit-attn-fullmap-keycolor-save-kfull-1-1 \
+  --out_dir /mnt/jfs/qwen-edit-attn-fullmap-keycolor-save-kfull-1-1-q-latent-range \
   --model_name /mnt/jfs/model_zoo/qwen/Qwen-Image-Edit-2511/ \
   --gpus "$gpu_ids" \
-  --key_txt /data/benchmark_metrics/insight/key_folder/analysis_key.txt \
+  --key_txt /data/benchmark_metrics/insight/key_folder/qwen/analysis_key.txt \
   --steps 28 \
   --true-cfg-scale 4.0 \
   --max-tokens 128 \

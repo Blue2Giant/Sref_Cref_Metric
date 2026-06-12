@@ -1,7 +1,7 @@
 import argparse
 import json
 import os
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 from PIL import Image
@@ -10,6 +10,27 @@ from huggingface_hub import hf_hub_download
 
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+PREFERRED_KONTEXT_RESOLUTIONS: List[Tuple[int, int]] = [
+    (672, 1568),
+    (688, 1504),
+    (720, 1456),
+    (752, 1392),
+    (800, 1328),
+    (832, 1248),
+    (880, 1184),
+    (944, 1104),
+    (1024, 1024),
+    (1104, 944),
+    (1184, 880),
+    (1248, 832),
+    (1328, 800),
+    (1392, 752),
+    (1456, 720),
+    (1504, 688),
+    (1568, 672),
+]
 
 
 def list_images(folder: str) -> Dict[str, str]:
@@ -23,6 +44,47 @@ def list_images(folder: str) -> Dict[str, str]:
             continue
         items[os.path.splitext(name)[0]] = path
     return items
+
+
+def parse_resolution(spec: str) -> tuple[int, int]:
+    text = str(spec).strip().lower()
+    if "x" not in text:
+        raise ValueError(f"invalid resolution: {spec}")
+    width_text, height_text = text.split("x", 1)
+    width = int(width_text)
+    height = int(height_text)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"invalid resolution: {spec}")
+    return width, height
+
+
+def _lanczos():
+    return getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+
+
+def resize_like_kontext_bucket(img: Image.Image) -> Tuple[Image.Image, Tuple[int, int]]:
+    """Resize an input/reference image to the closest flux_klein_9B Kontext bucket."""
+    w, h = img.size
+    aspect_ratio = w / float(h)
+    _, target_w, target_h = min(
+        (abs(aspect_ratio - (rw / float(rh))), rw, rh)
+        for (rw, rh) in PREFERRED_KONTEXT_RESOLUTIONS
+    )
+    if (w, h) == (target_w, target_h):
+        return img, (target_w, target_h)
+    return img.resize((target_w, target_h), resample=_lanczos()), (target_w, target_h)
+
+
+def output_size_from_resolution(output_resolution: str) -> Tuple[int, int] | None:
+    if not output_resolution:
+        return None
+    w, h = parse_resolution(output_resolution)
+    # DiffSynth Qwen/TeleStyle requires multiples of 16 for the sampled latent/noise canvas.
+    w = w - w % 16
+    h = h - h % 16
+    if w <= 0 or h <= 0:
+        raise ValueError(f"invalid output resolution after /16 alignment: {output_resolution}")
+    return w, h
 
 
 class ImageStyleInference:
@@ -94,26 +156,27 @@ class ImageStyleInference:
         seed: int,
         num_inference_steps: int,
         minedge: int,
+        output_resolution: str = "",
     ):
-        w, h = Image.open(content_ref).convert("RGB").size
-        minedge = minedge - minedge % 16
-        if w > h:
-            r = w / h
-            h = minedge
-            w = int(h * r) - int(h * r) % 16
-        else:
-            r = h / w
-            w = minedge
-            h = int(w * r) - int(w * r) % 16
+        # Input/reference images use the same bucket logic as flux_klein_9B.py.
+        # output_resolution controls only the sampled noise/output canvas.
+        with Image.open(content_ref) as img:
+            content_img = img.convert("RGB").copy()
+        with Image.open(style_ref) as img:
+            style_img = img.convert("RGB").copy()
 
-        images = [
-            Image.open(content_ref).convert("RGB").resize((w, h)),
-            Image.open(style_ref).convert("RGB").resize((minedge, minedge)),
-        ]
+        content_img, content_size = resize_like_kontext_bucket(content_img)
+        style_img, _style_size = resize_like_kontext_bucket(style_img)
+
+        output_size = output_size_from_resolution(output_resolution)
+        if output_size is None:
+            # Backward-compatible fallback for callers without --output_resolution: generate at content bucket size.
+            output_size = content_size
+        w, h = output_size
 
         image = self.pipe(
             prompt,
-            edit_image=images,
+            edit_image=[content_img, style_img],
             seed=seed,
             num_inference_steps=num_inference_steps,
             height=h,
@@ -121,6 +184,8 @@ class ImageStyleInference:
             edit_image_auto_resize=False,
             cfg_scale=1.0,
         )
+        if image.size != (w, h):
+            image = image.resize((w, h), resample=_lanczos())
         return image
 
 
@@ -141,6 +206,12 @@ def main():
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--steps", type=int, default=4)
     ap.add_argument("--minedge", type=int, default=1024)
+    ap.add_argument(
+        "--output_resolution",
+        type=str,
+        default="",
+        help='Set generated/noise output size as "WIDTHxHEIGHT", e.g. "1024x1024". Input refs use Kontext bucket resize.',
+    )
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
 
@@ -174,10 +245,19 @@ def main():
 
     engine = ImageStyleInference()
     with torch.no_grad():
-        for k in keys:
+        total = len(keys)
+        done = 0
+        skipped = 0
+        for idx, k in enumerate(keys, start=1):
             prompt = prompts[k]
             out_path = os.path.join(output_dir, f"{k}.png")
             if os.path.isfile(out_path):
+                skipped += 1
+                if idx % 10 == 0 or idx == total:
+                    print(
+                        f"[TeleStyle] scanned={idx}/{total} done={done} skipped={skipped}",
+                        flush=True,
+                    )
                 continue
             image = engine.inference(
                 prompt=prompt,
@@ -186,8 +266,15 @@ def main():
                 seed=args.seed,
                 num_inference_steps=args.steps,
                 minedge=args.minedge,
+                output_resolution=args.output_resolution,
             )
             image.save(out_path)
+            done += 1
+            if idx % 10 == 0 or idx == total:
+                print(
+                    f"[TeleStyle] scanned={idx}/{total} done={done} skipped={skipped}",
+                    flush=True,
+                )
 
 
 if __name__ == "__main__":

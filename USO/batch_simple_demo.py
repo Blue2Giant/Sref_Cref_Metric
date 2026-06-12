@@ -66,6 +66,12 @@ def parse_args():
     ap.add_argument("--save-attn-path", default="")
     ap.add_argument("--use-siglip", action="store_true")
     ap.add_argument("--sref-only", action="store_true")
+    ap.add_argument("--no-preprocess-ref", action="store_true",
+                    help="Do not resize/crop the content reference before VAE encoding; pass the input image at its original pixel size.")
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="Total number of parallel shards.")
+    ap.add_argument("--shard-index", type=int, default=0,
+                    help="This worker's 0-based shard index.")
     return ap.parse_args()
 
 
@@ -88,6 +94,16 @@ def main():
     missing = sorted(set(prompts_obj.keys()) - set(keys))
     if missing:
         print(f"[warn] 缺少配对的key数量: {len(missing)}")
+
+    if args.num_shards < 1:
+        raise ValueError("--num-shards must be >= 1")
+    if not (0 <= args.shard_index < args.num_shards):
+        raise ValueError("--shard-index must satisfy 0 <= shard-index < num-shards")
+
+    all_key_count = len(keys)
+    if args.num_shards > 1:
+        keys = [k for i, k in enumerate(keys) if i % args.num_shards == args.shard_index]
+        print(f"[info] shard {args.shard_index}/{args.num_shards}: {len(keys)}/{all_key_count} samples")
 
     if not keys:
         raise RuntimeError("没有可处理的样本")
@@ -124,7 +140,12 @@ def main():
                 continue
             id_img = load_image(cref_map[b])
             style_img = load_image(sref_map[b])
-            ref_imgs_pil = [preprocess_ref(id_img, args.content_ref_size)]
+            if args.no_preprocess_ref:
+                if id_img.size != (16, 16) and (id_img.size[0] % 16 != 0 or id_img.size[1] % 16 != 0):
+                    raise ValueError(f"--no-preprocess-ref requires content ref size to be divisible by 16, got {id_img.size}")
+                ref_imgs_pil = [id_img]
+            else:
+                ref_imgs_pil = [preprocess_ref(id_img, args.content_ref_size)]
             siglip_inputs = []
             if args.use_siglip and siglip_processor is not None:
                 with torch.no_grad():

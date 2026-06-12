@@ -76,6 +76,14 @@ def load_prompts(path: str) -> Dict[str, str]:
     return {str(k): str(v) for k, v in data.items()}
 
 
+def compute_noise_latent_token_count(height: int, width: int, vae_scale_factor: int) -> int:
+    vae_scale_factor = max(1, int(vae_scale_factor))
+    packed_multiple = vae_scale_factor * 2
+    packed_h = int(height) // packed_multiple
+    packed_w = int(width) // packed_multiple
+    return max(0, packed_h * packed_w)
+
+
 def _normalize_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     normalized: Dict[str, torch.Tensor] = {}
     prefixes = (
@@ -363,9 +371,10 @@ def split_keys_round_robin(keys: List[str], n_parts: int) -> List[List[str]]:
 
 
 class AttentionCollector:
-    def __init__(self, max_q_tokens: int, max_k_tokens: int):
+    def __init__(self, max_q_tokens: int, max_k_tokens: int, noise_q_token_count: int = 0):
         self.max_q_tokens = max(1, int(max_q_tokens))
         self.max_k_tokens = max(1, int(max_k_tokens))
+        self.noise_q_token_count = max(0, int(noise_q_token_count))
         self.handles = []
         self.maps: Dict[int, torch.Tensor] = {}
         self.meta: Dict[int, Dict[str, object]] = {}
@@ -377,6 +386,12 @@ class AttentionCollector:
 
     def _keep_all_tokens(self, n: int) -> torch.Tensor:
         return torch.arange(n, dtype=torch.long)
+
+    def _sample_query_tokens(self, n: int) -> Tuple[torch.Tensor, int]:
+        noise_q_end = min(max(0, int(n)), self.noise_q_token_count)
+        if noise_q_end > 0:
+            return self._sample_tokens(noise_q_end, self.max_q_tokens), noise_q_end
+        return self._sample_tokens(n, self.max_q_tokens), int(n)
 
     def _hook_fn(self, block_idx: int):
         def _fn(module, args, kwargs, output):
@@ -403,7 +418,7 @@ class AttentionCollector:
                 scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(float(hd))
                 attn = torch.softmax(scores, dim=-1)
                 attn = attn[0].detach().float().cpu()
-                q_idx = self._sample_tokens(attn.shape[1], self.max_q_tokens)
+                q_idx, noise_q_end = self._sample_query_tokens(attn.shape[1])
                 k_idx = self._keep_all_tokens(attn.shape[2])
                 attn = attn[:, q_idx][:, :, k_idx]
                 self.maps[block_idx] = attn
@@ -411,6 +426,10 @@ class AttentionCollector:
                     "has_encoder": bool(torch.is_tensor(encoder_hidden_states)),
                     "q_tokens_full": int(qn),
                     "k_tokens_full": int(kn),
+                    "q_focus_name": "noise" if noise_q_end > 0 else "full",
+                    "q_focus_start": 0,
+                    "q_focus_end_exclusive": int(noise_q_end),
+                    "q_focus_end_inclusive": int(noise_q_end - 1) if noise_q_end > 0 else -1,
                     "q_sample_indices": q_idx.tolist(),
                     "k_sample_indices": k_idx.tolist(),
                 }
@@ -922,6 +941,9 @@ def save_token_layout_summary(
     has_encoder = bool(meta.get("has_encoder", False))
     q_sample = [int(x) for x in meta.get("q_sample_indices", [])]
     k_sample = [int(x) for x in meta.get("k_sample_indices", [])]
+    q_focus_name = str(meta.get("q_focus_name", "full"))
+    q_focus_start = int(meta.get("q_focus_start", 0))
+    q_focus_end_exclusive = int(meta.get("q_focus_end_exclusive", q_full))
     q_text = "[]"
     k_text = "[]"
     q_non_text = "[]"
@@ -934,6 +956,9 @@ def save_token_layout_summary(
             text_tokens_est = 0
     if q_full > 0:
         q_non_text = f"[0-{q_full - 1}]"
+    q_focus = "[]"
+    if q_focus_end_exclusive > q_focus_start:
+        q_focus = f"[{q_focus_start}-{q_focus_end_exclusive - 1}]"
     if has_encoder and k_full > 0:
         text_end = min(max(text_tokens_est - 1, -1), k_full - 1)
         if text_end >= 0:
@@ -948,11 +973,12 @@ def save_token_layout_summary(
         f"key={key}",
         f"sample_block={sample_block}",
         f"head_aggregation=mean_or_max_by_arg",
-        f"q_source=hidden_states(latent/noise)",
+        f"q_source=hidden_states(latent/noise), sampled_focus={q_focus_name}",
         f"k_source={'encoder_hidden_states(cond: text+image/ref)' if has_encoder else 'hidden_states(latent/noise)'}",
         f"q_tokens_full={q_full}",
         f"k_tokens_full={k_full}",
         f"text_tokens_estimated={text_tokens_est}",
+        f"q_focus_range={q_focus}",
         f"q_text_range={q_text}",
         f"q_non_text_range={q_non_text}",
         f"k_text_range_estimated={k_text}",
@@ -1177,7 +1203,16 @@ def run_inference_worker(
 
             max_q_tokens = int(args.max_q_tokens) if int(args.max_q_tokens) > 0 else int(args.max_tokens)
             max_k_tokens = int(args.max_k_tokens) if int(args.max_k_tokens) > 0 else int(args.max_tokens)
-            collector = AttentionCollector(max_q_tokens=max_q_tokens, max_k_tokens=max_k_tokens)
+            noise_q_token_count = compute_noise_latent_token_count(
+                height=int(cref.size[1]),
+                width=int(cref.size[0]),
+                vae_scale_factor=int(getattr(pipe, "vae_scale_factor", 8)),
+            )
+            collector = AttentionCollector(
+                max_q_tokens=max_q_tokens,
+                max_k_tokens=max_k_tokens,
+                noise_q_token_count=noise_q_token_count,
+            )
             text_tokens_est = 0
             if hasattr(pipe, "tokenizer") and pipe.tokenizer is not None:
                 try:

@@ -32,10 +32,13 @@ python /data/benchmark_metrics/insight/attention_metrics_compare_key_groups.py \
     --summary-csv /data/benchmark_metrics/logs/attention_metrics_summary.csv
 
 
-python /data/benchmark_metrics/insight/attention_metrics_compare_key_groups_multi.py \
-    --root-dir /mnt/jfs/bench-bucket/sref_bench/sample_800_sref_200_content/flux-klein-9b-attn-fullmap \
-    --output-dir /data/benchmark_metrics/logs/flux_attn_key_group_compare \
-    --summary-csv /data/benchmark_metrics/logs/flux_attention_metrics_summary.csv
+python /data/benchmark_metrics/insight/attention_metrics_compare_key_groups.py \
+    --root-dir  /mnt/jfs/logs/ours_analysis_key/save_attn \
+    --output-dir /data/benchmark_metrics/logs/ours_attn_key_group_compare \
+    --success-txt /data/benchmark_metrics/insight/key_folder/ours/success.txt \
+    --complete-leakage-txt /data/benchmark_metrics/insight/key_folder/ours/complet_leakage.txt \
+    --content-leakage-txt /data/benchmark_metrics/insight/key_folder/ours/content_leakage.txt \
+    --device cuda
 """
 
 from __future__ import annotations
@@ -57,10 +60,10 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 
 try:
-    from insight.attention_metrics import compute_metrics_for_named_groups_from_pt
+    from insight.attention_metrics import compute_metrics_for_named_groups_from_pt, resolve_query_focus_metadata
     from insight.attention_metrics_export_csv import build_row, collect_fieldnames, iter_pt_files
 except ModuleNotFoundError:
-    from attention_metrics import compute_metrics_for_named_groups_from_pt
+    from attention_metrics import compute_metrics_for_named_groups_from_pt, resolve_query_focus_metadata
     from attention_metrics_export_csv import build_row, collect_fieldnames, iter_pt_files
 
 
@@ -101,6 +104,12 @@ class SampleMetrics:
     block_values: np.ndarray
     step_stride: int
     block_stride: int
+    q_focus_name: str
+    q_focus_start: int
+    q_focus_end_exclusive: int
+    q_focus_length: int
+    q_tokens_full: int
+    q_sample_len: int
     metrics: Dict[str, Dict[str, np.ndarray]]
 
 
@@ -122,14 +131,29 @@ def parse_args():
         help="TXT file with success keys",
     )
     parser.add_argument(
+        "--success-label",
+        default="Success",
+        help="Display label for the success cohort",
+    )
+    parser.add_argument(
         "--content-leakage-txt",
         default="/data/benchmark_metrics/insight/key_folder/content_leakage.txt",
         help="TXT file with content leakage keys",
     )
     parser.add_argument(
+        "--content-leakage-label",
+        default="Content Leakage",
+        help="Display label for the content-leakage cohort",
+    )
+    parser.add_argument(
         "--complete-leakage-txt",
         default="/data/benchmark_metrics/insight/key_folder/complet_leakage.txt",
         help="TXT file with complete leakage keys",
+    )
+    parser.add_argument(
+        "--complete-leakage-label",
+        default="Complete Leakage",
+        help="Display label for the complete-leakage cohort",
     )
     parser.add_argument(
         "--summary-csv",
@@ -190,6 +214,45 @@ def read_keys(path: Path) -> List[str]:
             seen.add(s)
             keys.append(s)
     return keys
+
+
+def format_q_focus_range(start: int, end_exclusive: int) -> str:
+    if int(end_exclusive) <= int(start):
+        return "[]"
+    return f"[{int(start)}-{int(end_exclusive) - 1}]"
+
+
+def summarize_query_focus(samples: Sequence[SampleMetrics]) -> Dict[str, object]:
+    counts: Dict[str, int] = {}
+    example_ranges: Dict[str, str] = {}
+    for item in samples:
+        name = str(item.q_focus_name or "unknown").strip() or "unknown"
+        counts[name] = counts.get(name, 0) + 1
+        example_ranges.setdefault(name, format_q_focus_range(item.q_focus_start, item.q_focus_end_exclusive))
+
+    if not counts:
+        return {
+            "counts": {},
+            "title_suffix": "query=unknown",
+            "note": "Query sampling focus could not be resolved.",
+        }
+
+    if len(counts) == 1:
+        name = next(iter(counts.keys()))
+        return {
+            "counts": counts,
+            "example_ranges": example_ranges,
+            "title_suffix": f"query={name}",
+            "note": f"All selected samples use query focus `{name}` at {example_ranges.get(name, '[]')}.",
+        }
+
+    parts = [f"{name}:{counts[name]}" for name in sorted(counts.keys())]
+    return {
+        "counts": counts,
+        "example_ranges": example_ranges,
+        "title_suffix": "query=mixed",
+        "note": "Selected samples mix query focus settings: " + ", ".join(parts) + ".",
+    }
 
 
 def resolve_pt_path(root_dir: Path, key: str) -> Optional[Path]:
@@ -331,6 +394,7 @@ def collect_samples(
 
             step_values = np.arange(int(batch.attn.shape[0]), dtype=np.int64) * step_stride
             block_values = np.arange(int(batch.attn.shape[1]), dtype=np.int64) * block_stride
+            q_focus = resolve_query_focus_metadata(batch.payload)
 
             filtered_metrics: Dict[str, Dict[str, np.ndarray]] = {}
             for group_name in group_names:
@@ -359,6 +423,12 @@ def collect_samples(
                     block_values=block_values,
                     step_stride=step_stride,
                     block_stride=block_stride,
+                    q_focus_name=str(q_focus.get("q_focus_name", "unknown")),
+                    q_focus_start=int(q_focus.get("q_focus_start", 0)),
+                    q_focus_end_exclusive=int(q_focus.get("q_focus_end_exclusive", 0)),
+                    q_focus_length=int(q_focus.get("q_focus_length", 0)),
+                    q_tokens_full=int(q_focus.get("q_tokens_full", batch.payload.get("q_tokens_full", 0) or 0)),
+                    q_sample_len=int(q_focus.get("q_sample_len", len(batch.payload.get("q_sample_indices") or []))),
                     metrics=filtered_metrics,
                 )
             )
@@ -401,6 +471,12 @@ def load_samples_from_long_csv(
                     "step_map": {},
                     "block_map": {},
                     "values": {},
+                    "q_focus_name": str(row.get("q_focus_name", "")).strip() or "unknown",
+                    "q_focus_start": int(row.get("q_focus_start", "0") or 0),
+                    "q_focus_end_exclusive": int(row.get("q_focus_end_exclusive", "0") or 0),
+                    "q_focus_length": int(row.get("q_focus_length", "0") or 0),
+                    "q_tokens_full": int(row.get("q_tokens_full", "0") or 0),
+                    "q_sample_len": int(row.get("q_sample_len", "0") or 0),
                 },
             )
             step_idx = int(row["step_idx"])
@@ -454,6 +530,12 @@ def load_samples_from_long_csv(
                 block_values=block_values,
                 step_stride=step_stride,
                 block_stride=block_stride,
+                q_focus_name=str(payload.get("q_focus_name", "unknown")),
+                q_focus_start=int(payload.get("q_focus_start", 0)),
+                q_focus_end_exclusive=int(payload.get("q_focus_end_exclusive", 0)),
+                q_focus_length=int(payload.get("q_focus_length", 0)),
+                q_tokens_full=int(payload.get("q_tokens_full", 0)),
+                q_sample_len=int(payload.get("q_sample_len", 0)),
                 metrics=metrics,
             )
         )
@@ -472,6 +554,11 @@ def write_sample_manifest(path: Path, samples: Sequence[SampleMetrics]):
         "num_blocks",
         "step_stride",
         "block_stride",
+        "q_focus_name",
+        "q_focus_range",
+        "q_focus_length",
+        "q_tokens_full",
+        "q_sample_len",
     ]
     rows = []
     for item in samples:
@@ -485,6 +572,11 @@ def write_sample_manifest(path: Path, samples: Sequence[SampleMetrics]):
                 "num_blocks": len(item.block_values),
                 "step_stride": item.step_stride,
                 "block_stride": item.block_stride,
+                "q_focus_name": item.q_focus_name,
+                "q_focus_range": format_q_focus_range(item.q_focus_start, item.q_focus_end_exclusive),
+                "q_focus_length": item.q_focus_length,
+                "q_tokens_full": item.q_tokens_full,
+                "q_sample_len": item.q_sample_len,
             }
         )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -512,6 +604,12 @@ def write_long_and_agg_csvs(
         "step_value",
         "block_idx",
         "block_value",
+        "q_focus_name",
+        "q_focus_start",
+        "q_focus_end_exclusive",
+        "q_focus_length",
+        "q_tokens_full",
+        "q_sample_len",
         "value",
     ]
     agg_fieldnames = [
@@ -523,6 +621,12 @@ def write_long_and_agg_csvs(
         "step_value",
         "block_idx",
         "block_value",
+        "q_focus_name",
+        "q_focus_start",
+        "q_focus_end_exclusive",
+        "q_focus_length",
+        "q_tokens_full",
+        "q_sample_len",
         "n",
         "mean",
         "std",
@@ -561,6 +665,12 @@ def write_long_and_agg_csvs(
                                 "step_value": int(item.step_values[step_idx]),
                                 "block_idx": int(block_idx),
                                 "block_value": int(item.block_values[block_idx]),
+                                "q_focus_name": item.q_focus_name,
+                                "q_focus_start": item.q_focus_start,
+                                "q_focus_end_exclusive": item.q_focus_end_exclusive,
+                                "q_focus_length": item.q_focus_length,
+                                "q_tokens_full": item.q_tokens_full,
+                                "q_sample_len": item.q_sample_len,
                                 "value": value,
                             }
                             writer.writerow(row)
@@ -573,6 +683,12 @@ def write_long_and_agg_csvs(
                                 int(item.step_values[step_idx]),
                                 int(block_idx),
                                 int(item.block_values[block_idx]),
+                                item.q_focus_name,
+                                int(item.q_focus_start),
+                                int(item.q_focus_end_exclusive),
+                                int(item.q_focus_length),
+                                int(item.q_tokens_full),
+                                int(item.q_sample_len),
                             )
                             bucket.setdefault(key, []).append(value)
 
@@ -594,6 +710,12 @@ def write_long_and_agg_csvs(
                     "step_value": key[5],
                     "block_idx": key[6],
                     "block_value": key[7],
+                    "q_focus_name": key[8],
+                    "q_focus_start": key[9],
+                    "q_focus_end_exclusive": key[10],
+                    "q_focus_length": key[11],
+                    "q_tokens_full": key[12],
+                    "q_sample_len": key[13],
                     "n": n,
                     "mean": float(np.mean(values)),
                     "std": std,
@@ -691,7 +813,14 @@ def add_shared_legend(fig: plt.Figure, axes: np.ndarray):
     frame.set_linewidth(0.8)
 
 
-def plot_first_last_block(metric_name: str, group_names: Sequence[str], cohort_specs: Sequence[CohortSpec], samples: Sequence[SampleMetrics], out_path: Path):
+def plot_first_last_block(
+    metric_name: str,
+    group_names: Sequence[str],
+    cohort_specs: Sequence[CohortSpec],
+    samples: Sequence[SampleMetrics],
+    out_path: Path,
+    query_focus_suffix: str = "",
+):
     fig, axes = plt.subplots(len(group_names), 2, figsize=(14, 4 * len(group_names)), sharex=False, squeeze=False)
     for row, group_name in enumerate(group_names):
         step_grid, block_grid = most_common_grid(samples, group_name, metric_name)
@@ -723,14 +852,24 @@ def plot_first_last_block(metric_name: str, group_names: Sequence[str], cohort_s
             ax.set_ylabel(metric_name)
             ax.grid(alpha=0.25, linestyle="--", linewidth=0.6)
     add_shared_legend(fig, axes)
-    fig.suptitle(f"First/Last Block Time Curves | {metric_name}", y=0.985)
+    title = f"First/Last Block Time Curves | {metric_name}"
+    if query_focus_suffix:
+        title += f" | {query_focus_suffix}"
+    fig.suptitle(title, y=0.985)
     fig.tight_layout(rect=[0, 0, 0.86, 0.95])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_cohort_heatmaps(metric_name: str, group_names: Sequence[str], cohort_specs: Sequence[CohortSpec], samples: Sequence[SampleMetrics], out_path: Path):
+def plot_cohort_heatmaps(
+    metric_name: str,
+    group_names: Sequence[str],
+    cohort_specs: Sequence[CohortSpec],
+    samples: Sequence[SampleMetrics],
+    out_path: Path,
+    query_focus_suffix: str = "",
+):
     fig, axes = plt.subplots(len(group_names), len(cohort_specs), figsize=(4.8 * len(cohort_specs), 3.8 * len(group_names)), squeeze=False)
     for row, group_name in enumerate(group_names):
         step_grid, block_grid = most_common_grid(samples, group_name, metric_name)
@@ -783,14 +922,23 @@ def plot_cohort_heatmaps(metric_name: str, group_names: Sequence[str], cohort_sp
             ax.set_yticklabels(block_grid)
         if images:
             fig.colorbar(images[0], ax=axes[row, :].tolist(), shrink=0.88, pad=0.01)
-    fig.suptitle(f"Cohort Mean Heatmaps | {metric_name}", y=0.995)
+    title = f"Cohort Mean Heatmaps | {metric_name}"
+    if query_focus_suffix:
+        title += f" | {query_focus_suffix}"
+    fig.suptitle(title, y=0.995)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_difference_heatmaps(metric_name: str, group_names: Sequence[str], samples: Sequence[SampleMetrics], out_path: Path):
+def plot_difference_heatmaps(
+    metric_name: str,
+    group_names: Sequence[str],
+    samples: Sequence[SampleMetrics],
+    out_path: Path,
+    query_focus_suffix: str = "",
+):
     diff_specs = [
         ("content_leakage", "success", "content-success"),
         ("complete_leakage", "success", "complete-success"),
@@ -845,14 +993,24 @@ def plot_difference_heatmaps(metric_name: str, group_names: Sequence[str], sampl
             ax.set_yticklabels(block_grid)
         if images:
             fig.colorbar(images[0], ax=axes[row, :].tolist(), shrink=0.88, pad=0.01)
-    fig.suptitle(f"Cohort Difference Heatmaps | {metric_name}", y=0.995)
+    title = f"Cohort Difference Heatmaps | {metric_name}"
+    if query_focus_suffix:
+        title += f" | {query_focus_suffix}"
+    fig.suptitle(title, y=0.995)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_block_profiles(metric_name: str, group_names: Sequence[str], cohort_specs: Sequence[CohortSpec], samples: Sequence[SampleMetrics], out_path: Path):
+def plot_block_profiles(
+    metric_name: str,
+    group_names: Sequence[str],
+    cohort_specs: Sequence[CohortSpec],
+    samples: Sequence[SampleMetrics],
+    out_path: Path,
+    query_focus_suffix: str = "",
+):
     fig, axes = plt.subplots(len(group_names), 3, figsize=(15, 3.8 * len(group_names)), squeeze=False, sharex=False, sharey="row")
     for row, group_name in enumerate(group_names):
         step_grid, block_grid = most_common_grid(samples, group_name, metric_name)
@@ -883,15 +1041,21 @@ def plot_block_profiles(metric_name: str, group_names: Sequence[str], cohort_spe
             ax.set_ylabel(metric_name)
             ax.grid(alpha=0.25, linestyle="--", linewidth=0.6)
     add_shared_legend(fig, axes)
-    fig.suptitle(f"Block Profiles in Early/Mid/Late Steps | {metric_name}", y=0.985)
+    title = f"Block Profiles in Early/Mid/Late Steps | {metric_name}"
+    if query_focus_suffix:
+        title += f" | {query_focus_suffix}"
+    fig.suptitle(title, y=0.985)
     fig.tight_layout(rect=[0, 0, 0.86, 0.95])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
-def write_plot_notes(path: Path):
-    text = """# Plot Guide
+def write_plot_notes(path: Path, query_focus_note: str):
+    text = f"""# Plot Guide
+
+Query focus:
+{query_focus_note}
 
 1. `first_last_block/*.png`
 Shows how each metric evolves over time at the earliest and deepest sampled block.
@@ -931,19 +1095,19 @@ def main():
     cohort_specs = [
         CohortSpec(
             name="success",
-            label="Success",
+            label=str(args.success_label),
             key_file=Path(args.success_txt),
             color="#2E8B57",
         ),
         CohortSpec(
             name="content_leakage",
-            label="Content Leakage",
+            label=str(args.content_leakage_label),
             key_file=Path(args.content_leakage_txt),
             color="#E69F00",
         ),
         CohortSpec(
             name="complete_leakage",
-            label="Complete Leakage",
+            label=str(args.complete_leakage_label),
             key_file=Path(args.complete_leakage_txt),
             color="#D55E00",
         ),
@@ -993,7 +1157,12 @@ def main():
         long_csv=selected_long_csv,
         agg_csv=cohort_agg_csv,
     )
-    write_plot_notes(output_dir / "plot_notes.md")
+    query_focus_summary = summarize_query_focus(samples)
+    write_plot_notes(output_dir / "plot_notes.md", str(query_focus_summary.get("note", "")))
+    (output_dir / "query_focus_summary.json").write_text(
+        json.dumps(query_focus_summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     first_last_dir = output_dir / "plots" / "first_last_block"
     heatmap_dir = output_dir / "plots" / "cohort_heatmaps"
@@ -1002,10 +1171,37 @@ def main():
     for metric_name in metric_names:
         safe = sanitize_filename(metric_name)
         log(f"[plot] metric={metric_name}")
-        plot_first_last_block(metric_name, group_names, cohort_specs, samples, first_last_dir / f"{safe}.png")
-        plot_cohort_heatmaps(metric_name, group_names, cohort_specs, samples, heatmap_dir / f"{safe}.png")
-        plot_difference_heatmaps(metric_name, group_names, samples, diff_dir / f"{safe}.png")
-        plot_block_profiles(metric_name, group_names, cohort_specs, samples, block_profile_dir / f"{safe}.png")
+        plot_first_last_block(
+            metric_name,
+            group_names,
+            cohort_specs,
+            samples,
+            first_last_dir / f"{safe}.png",
+            query_focus_suffix=str(query_focus_summary.get("title_suffix", "")),
+        )
+        plot_cohort_heatmaps(
+            metric_name,
+            group_names,
+            cohort_specs,
+            samples,
+            heatmap_dir / f"{safe}.png",
+            query_focus_suffix=str(query_focus_summary.get("title_suffix", "")),
+        )
+        plot_difference_heatmaps(
+            metric_name,
+            group_names,
+            samples,
+            diff_dir / f"{safe}.png",
+            query_focus_suffix=str(query_focus_summary.get("title_suffix", "")),
+        )
+        plot_block_profiles(
+            metric_name,
+            group_names,
+            cohort_specs,
+            samples,
+            block_profile_dir / f"{safe}.png",
+            query_focus_suffix=str(query_focus_summary.get("title_suffix", "")),
+        )
 
     meta = {
         "root_dir": str(root_dir),
@@ -1016,6 +1212,7 @@ def main():
         "group_names": list(group_names),
         "metric_names": list(metric_names),
         "num_selected_samples": len(samples),
+        "query_focus_summary": query_focus_summary,
         "cohorts": [
             {
                 "name": x.name,

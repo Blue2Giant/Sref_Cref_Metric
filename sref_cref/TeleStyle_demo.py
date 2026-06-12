@@ -1,9 +1,71 @@
 import torch
 import os
+from typing import List, Tuple
 from PIL import Image
 from diffsynth.pipelines.qwen_image import QwenImagePipeline, ModelConfig
 from huggingface_hub import hf_hub_download
 
+
+
+
+PREFERRED_KONTEXT_RESOLUTIONS: List[Tuple[int, int]] = [
+    (672, 1568),
+    (688, 1504),
+    (720, 1456),
+    (752, 1392),
+    (800, 1328),
+    (832, 1248),
+    (880, 1184),
+    (944, 1104),
+    (1024, 1024),
+    (1104, 944),
+    (1184, 880),
+    (1248, 832),
+    (1328, 800),
+    (1392, 752),
+    (1456, 720),
+    (1504, 688),
+    (1568, 672),
+]
+
+
+def _lanczos():
+    return getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+
+
+def resize_like_kontext_bucket(img: Image.Image) -> Tuple[Image.Image, Tuple[int, int]]:
+    w, h = img.size
+    aspect_ratio = w / float(h)
+    _, target_w, target_h = min(
+        (abs(aspect_ratio - (rw / float(rh))), rw, rh)
+        for (rw, rh) in PREFERRED_KONTEXT_RESOLUTIONS
+    )
+    if (w, h) == (target_w, target_h):
+        return img, (target_w, target_h)
+    return img.resize((target_w, target_h), resample=_lanczos()), (target_w, target_h)
+
+
+def parse_resolution(spec: str) -> Tuple[int, int]:
+    text = str(spec).strip().lower()
+    if "x" not in text:
+        raise ValueError(f"invalid resolution: {spec}")
+    w_str, h_str = text.split("x", 1)
+    w = int(w_str)
+    h = int(h_str)
+    if w <= 0 or h <= 0:
+        raise ValueError(f"invalid resolution: {spec}")
+    return w, h
+
+
+def output_size_from_resolution(output_resolution: str) -> Tuple[int, int] | None:
+    if not output_resolution:
+        return None
+    w, h = parse_resolution(output_resolution)
+    w = w - w % 16
+    h = h - h % 16
+    if w <= 0 or h <= 0:
+        raise ValueError(f"invalid output resolution after /16 alignment: {output_resolution}")
+    return w, h
 
 class ImageStyleInference:
    
@@ -68,35 +130,36 @@ class ImageStyleInference:
         seed=123,
         num_inference_steps=4,
         minedge=1024,
+        output_resolution="",
         ):
-        w, h = Image.open(content_ref).convert("RGB").size
-        minedge=minedge-minedge%16
+        # Input/reference images use the same bucket logic as flux_klein_9B.py.
+        # output_resolution controls only the sampled noise/output canvas.
+        with Image.open(content_ref) as img:
+            content_img = img.convert("RGB").copy()
+        with Image.open(style_ref) as img:
+            style_img = img.convert("RGB").copy()
 
-        if w > h:
-            r = w / h
-            h = minedge
-            w = int(h * r) - int(h * r) % 16
-        else:
-            r = h / w
-            w = minedge
-            h = int(w * r) - int(w * r) % 16
+        content_img, content_size = resize_like_kontext_bucket(content_img)
+        style_img, _style_size = resize_like_kontext_bucket(style_img)
 
-        images = [
-            Image.open(content_ref).convert("RGB").resize((w, h)),
-            Image.open(style_ref).convert("RGB").resize((minedge, minedge)),
-        ]
+        output_size = output_size_from_resolution(output_resolution)
+        if output_size is None:
+            output_size = content_size
+        w, h = output_size
 
         image = self.pipe(
-            prompt, 
-            edit_image=images, 
-            seed=seed, 
-            num_inference_steps=num_inference_steps, 
-            height=h, 
+            prompt,
+            edit_image=[content_img, style_img],
+            seed=seed,
+            num_inference_steps=num_inference_steps,
+            height=h,
             width=w,
             edit_image_auto_resize=False,
             cfg_scale=1.0
         )  # lightning
 
+        if image.size != (w, h):
+            image = image.resize((w, h), resample=_lanczos())
         return image
 
 

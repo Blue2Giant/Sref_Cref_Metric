@@ -3,7 +3,7 @@
 DEFAULT_GROUPS=("l40s_yangtong" "buffer" "maintain")
 DEFAULT_GROUP="buffer"
 DEFAULT_GPU=8
-DEFAULT_CPU=64
+DEFAULT_CPU=100
 DEFAULT_MEMORY=1000000
 
 show_help() {

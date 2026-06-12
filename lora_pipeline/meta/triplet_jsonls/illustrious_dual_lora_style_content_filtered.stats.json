@@ -1,0 +1,14 @@
+{
+  "content_jsonl": "/data/benchmark_metrics/lora_pipeline/meta/triplet_jsonls/illustrious_content_one_lora.jsonl",
+  "style_jsonl": "/data/benchmark_metrics/lora_pipeline/meta/triplet_jsonls/illustrious_style_one_lora.jsonl",
+  "dual_jsonl": "/data/benchmark_metrics/lora_pipeline/meta/triplet_jsonls/illustrious_dual_lora.jsonl",
+  "out_jsonl": "/data/benchmark_metrics/lora_pipeline/meta/triplet_jsonls/illustrious_dual_lora_style_content_filtered.jsonl",
+  "content_id_count": 799,
+  "style_id_count": 191,
+  "total_rows": 24646,
+  "kept_rows": 24646,
+  "dropped_rows": 0,
+  "malformed_rows": 0,
+  "left_content_right_style": 0,
+  "left_style_right_content": 24646
+}
